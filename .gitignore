@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+server/data/*.json
+.gstack/
+*.log
+client/.cert/
+Agents/

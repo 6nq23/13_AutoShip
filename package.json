@@ -1,0 +1,19 @@
+{
+  "name": "autoship",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": ["client", "server"],
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w client && npm run build -w server",
+    "typecheck": "npm run typecheck -w client && npm run typecheck -w server",
+    "test": "npm test -w client && npm test -w server",
+    "check": "npm run typecheck && npm test && npm run build",
+    "start": "npm start -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  },
+  "engines": { "node": ">=20" }
+}
+
