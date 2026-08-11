@@ -112,7 +112,7 @@ export class PostgresStore implements Store {
   }
 
   async getHistory() {
-    const { rows } = await this.pool.query<{ payload: Batch }>("SELECT payload FROM shipping_batches ORDER BY created_at DESC LIMIT 500");
+    const { rows } = await this.pool.query<{ payload: Batch }>("SELECT payload FROM shipping_batches ORDER BY created_at DESC");
     return rows.map(({ payload }) => payload);
   }
 

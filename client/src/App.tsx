@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { IScannerControls } from "@zxing/browser";
-import { AlertTriangle, Box, Camera, Check, ChevronRight, CircleUserRound, Clock3, Database, Download, History, Keyboard, LoaderCircle, LogOut, PackageCheck, Plus, RefreshCw, ScanLine, Settings, ShieldCheck, Trash2, Truck } from "lucide-react";
+import { AlertTriangle, BarChart3, Box, CalendarDays, Camera, Check, ChevronRight, CircleUserRound, Clock3, Database, Download, Filter, History, Keyboard, LoaderCircle, LogOut, PackageCheck, Plus, RefreshCw, ScanLine, Search, Settings, ShieldCheck, Trash2, Truck } from "lucide-react";
 import { api, clearToken, getToken, HistoryItem, normalizeOrder, setToken, ShipResult, ShippingJob, ShippingLog, User } from "./api";
 
-type Tab = "scan" | "history" | "settings";
+type Tab = "scan" | "history" | "analytics" | "settings";
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -72,16 +72,18 @@ function Workspace({ user, demoMode, onLogout }: { user: User; demoMode: boolean
       <nav aria-label="Main navigation">
         <NavButton active={tab === "scan"} onClick={() => setTab("scan")} icon={<ScanLine />}>Ship orders</NavButton>
         <NavButton active={tab === "history"} onClick={() => setTab("history")} icon={<History />}>History</NavButton>
+        <NavButton active={tab === "analytics"} onClick={() => setTab("analytics")} icon={<BarChart3 />}>Analytics</NavButton>
         {user.role === "admin" && <NavButton active={tab === "settings"} onClick={() => setTab("settings")} icon={<Settings />}>Settings</NavButton>}
       </nav>
       <div className="profile"><div className="avatar">{user.username.slice(0, 2).toUpperCase()}</div><div><strong>{user.username}</strong><small>{user.role}</small></div><button aria-label="Sign out" onClick={onLogout}><LogOut /></button></div>
     </aside>
     <header className="mobile-header"><div className="brand-mark"><Truck size={20} /> AutoShip</div><button onClick={onLogout} aria-label="Sign out"><LogOut /></button></header>
     {demoMode && <div className="demo-banner"><span>Demo mode</span> Try RBD4023, RBD4030, RBD4035, and RBD4044</div>}
-    <main className="workspace">{tab === "scan" ? <ShipWorkspace /> : tab === "history" ? <HistoryPage /> : <SettingsPage />}</main>
+    <main className="workspace">{tab === "scan" ? <ShipWorkspace /> : tab === "history" ? <HistoryPage /> : tab === "analytics" ? <AnalyticsPage /> : <SettingsPage />}</main>
     <nav className="bottom-nav" aria-label="Mobile navigation">
       <NavButton active={tab === "scan"} onClick={() => setTab("scan")} icon={<ScanLine />}>Ship</NavButton>
       <NavButton active={tab === "history"} onClick={() => setTab("history")} icon={<History />}>History</NavButton>
+      <NavButton active={tab === "analytics"} onClick={() => setTab("analytics")} icon={<BarChart3 />}>Analytics</NavButton>
       {user.role === "admin" && <NavButton active={tab === "settings"} onClick={() => setTab("settings")} icon={<Settings />}>Settings</NavButton>}
     </nav>
   </div>;
@@ -244,6 +246,166 @@ function JobProgress({ job }: { job: ShippingJob }) {
 
 function Results({ result, logs, onRetry }: { result: ShipResult; logs: ShippingLog[]; onRetry: () => void }) {
   return <section className="results-section"><div className="page-heading compact"><div><p className="eyebrow">Batch result</p><h2>{result.totalFailed ? "Partially shipped" : "All done"}</h2></div><div className="result-actions">{result.labelUrl && <a className="button primary" href={result.labelUrl} target="_blank" rel="noreferrer"><Download /> Download labels</a>}{result.failed.length > 0 && <button className="button error-download" onClick={() => downloadFailureReport(result)}><Download /> Download errors</button>}<button className="button secondary" onClick={() => downloadLogs(logs, result.batchId)}><Download /> Download logs</button></div></div><div className="results-grid"><div className="card result-card success-card"><div className="result-title"><span><Check /></span><div><strong>{result.totalShipped} shipped</strong><small>Ready for labels</small></div></div>{result.shipped.map((item) => <div className="result-row" key={item.orderNumber}><div><strong>{item.orderNumber}</strong><small>{item.awb}</small></div><div><span>{item.courier}</span><small>₹{item.cost.toFixed(2)}{item.alreadyBooked ? " · already booked" : ""}</small></div></div>)}</div><div className="card result-card failure-card"><div className="result-title"><span><AlertTriangle /></span><div><strong>{result.totalFailed} need attention</strong><small>Fix and try again</small></div></div>{result.failed.length ? result.failed.map((item) => <div className="result-row" key={item.orderNumber}><div><strong>{item.orderNumber}</strong><small>{item.code}</small></div><span>{item.error}</span></div>) : <div className="mini-empty">No failures in this batch.</div>}{result.failed.length > 0 && <button className="button secondary wide" onClick={onRetry}><RefreshCw /> Retry failed</button>}</div></div></section>;
+}
+
+type AnalyticsRange = "all" | "today" | "yesterday" | "day-before" | "tomorrow" | "week" | "month" | "last-7" | "last-30" | "custom";
+type AnalyticsRow = {
+  key: string; createdAt: string; batchId: string; shippedBy: string; status: "shipped" | "failed";
+  orderNumber: string; orderId: string; awb: string; courier: string; cost: number; code: string; error: string; alreadyBooked: boolean;
+};
+
+const startOfDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
+const addDays = (date: Date, days: number) => { const next = new Date(date); next.setDate(next.getDate() + days); return next; };
+const dayKey = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+const compactNumber = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 });
+
+function AnalyticsPage() {
+  const [batches, setBatches] = useState<HistoryItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [range, setRange] = useState<AnalyticsRange>("all");
+  const [from, setFrom] = useState(""); const [to, setTo] = useState("");
+  const [query, setQuery] = useState(""); const [status, setStatus] = useState("all");
+  const [courier, setCourier] = useState("all"); const [operator, setOperator] = useState("all");
+
+  useEffect(() => {
+    api.history().then(({ batches: items }) => setBatches(items)).catch((cause) => setError(cause instanceof Error ? cause.message : "Analytics could not be loaded.")).finally(() => setLoading(false));
+  }, []);
+
+  const rows = useMemo<AnalyticsRow[]>(() => batches.flatMap((batch) => [
+    ...batch.shipped.map((item, index) => ({ key: `${batch.batchId}-s-${index}`, createdAt: batch.createdAt, batchId: batch.batchId, shippedBy: batch.shippedBy, status: "shipped" as const, orderNumber: item.orderNumber, orderId: item.orderId, awb: item.awb, courier: item.courier, cost: item.cost, code: "", error: "", alreadyBooked: Boolean(item.alreadyBooked) })),
+    ...batch.failed.map((item, index) => ({ key: `${batch.batchId}-f-${index}`, createdAt: batch.createdAt, batchId: batch.batchId, shippedBy: batch.shippedBy, status: "failed" as const, orderNumber: item.orderNumber, orderId: "", awb: "", courier: "", cost: 0, code: item.code, error: item.error, alreadyBooked: false })),
+  ]).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)), [batches]);
+
+  const couriers = useMemo(() => [...new Set(rows.map((row) => row.courier).filter(Boolean))].sort(), [rows]);
+  const operators = useMemo(() => [...new Set(rows.map((row) => row.shippedBy).filter(Boolean))].sort(), [rows]);
+  const bounds = useMemo(() => {
+    const today = startOfDay(new Date()); let start: Date | null = null; let end: Date | null = null;
+    if (range === "today") { start = today; end = addDays(today, 1); }
+    if (range === "yesterday") { start = addDays(today, -1); end = today; }
+    if (range === "day-before") { start = addDays(today, -2); end = addDays(today, -1); }
+    if (range === "tomorrow") { start = addDays(today, 1); end = addDays(today, 2); }
+    if (range === "week") { start = addDays(today, -((today.getDay() + 6) % 7)); end = addDays(today, 1); }
+    if (range === "month") { start = new Date(today.getFullYear(), today.getMonth(), 1); end = addDays(today, 1); }
+    if (range === "last-7") { start = addDays(today, -6); end = addDays(today, 1); }
+    if (range === "last-30") { start = addDays(today, -29); end = addDays(today, 1); }
+    if (range === "custom") { start = from ? startOfDay(new Date(`${from}T00:00:00`)) : null; end = to ? addDays(startOfDay(new Date(`${to}T00:00:00`)), 1) : null; }
+    return { start, end };
+  }, [range, from, to]);
+
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return rows.filter((row) => {
+      const time = Date.parse(row.createdAt);
+      if (bounds.start && time < bounds.start.getTime()) return false;
+      if (bounds.end && time >= bounds.end.getTime()) return false;
+      if (status !== "all" && row.status !== status) return false;
+      if (courier !== "all" && row.courier !== courier) return false;
+      if (operator !== "all" && row.shippedBy !== operator) return false;
+      return !needle || [row.orderNumber, row.orderId, row.awb, row.batchId, row.shippedBy, row.courier, row.code, row.error].some((value) => value.toLowerCase().includes(needle));
+    });
+  }, [rows, bounds, query, status, courier, operator]);
+
+  const metrics = useMemo(() => {
+    const shipped = filtered.filter((row) => row.status === "shipped"); const failed = filtered.length - shipped.length;
+    const totalCost = shipped.reduce((sum, row) => sum + row.cost, 0); const batchCount = new Set(filtered.map((row) => row.batchId)).size;
+    return { shipped: shipped.length, failed, total: filtered.length, totalCost, batchCount, success: filtered.length ? shipped.length / filtered.length * 100 : 0, averageCost: shipped.length ? totalCost / shipped.length : 0 };
+  }, [filtered]);
+
+  const periodTotals = useMemo(() => {
+    const today = startOfDay(new Date());
+    const count = (start: Date, end: Date) => rows.filter((row) => row.status === "shipped" && Date.parse(row.createdAt) >= start.getTime() && Date.parse(row.createdAt) < end.getTime()).length;
+    return [
+      { label: "Today", value: count(today, addDays(today, 1)), note: today.toLocaleDateString(undefined, { day: "numeric", month: "short" }) },
+      { label: "Tomorrow", value: count(addDays(today, 1), addDays(today, 2)), note: addDays(today, 1).toLocaleDateString(undefined, { day: "numeric", month: "short" }) },
+      { label: "Yesterday", value: count(addDays(today, -1), today), note: addDays(today, -1).toLocaleDateString(undefined, { day: "numeric", month: "short" }) },
+      { label: "Day before", value: count(addDays(today, -2), addDays(today, -1)), note: addDays(today, -2).toLocaleDateString(undefined, { day: "numeric", month: "short" }) },
+      { label: "This week", value: count(addDays(today, -((today.getDay() + 6) % 7)), addDays(today, 1)), note: "Mon to today" },
+      { label: "This month", value: count(new Date(today.getFullYear(), today.getMonth(), 1), addDays(today, 1)), note: today.toLocaleDateString(undefined, { month: "long" }) },
+    ];
+  }, [rows]);
+
+  const daily = useMemo(() => {
+    const today = startOfDay(new Date());
+    const points = Array.from({ length: 14 }, (_, index) => { const date = addDays(today, index - 13); return { date, key: dayKey(date), shipped: 0, failed: 0 }; });
+    const byDay = new Map(points.map((point) => [point.key, point]));
+    filtered.forEach((row) => { const point = byDay.get(dayKey(new Date(row.createdAt))); if (point) point[row.status] += 1; });
+    return points;
+  }, [filtered]);
+  const chartMax = Math.max(1, ...daily.map((point) => point.shipped + point.failed));
+
+  const courierStats = useMemo(() => {
+    const grouped = new Map<string, { name: string; count: number; cost: number }>();
+    filtered.filter((row) => row.status === "shipped").forEach((row) => { const item = grouped.get(row.courier) || { name: row.courier || "Unknown", count: 0, cost: 0 }; item.count += 1; item.cost += row.cost; grouped.set(row.courier, item); });
+    return [...grouped.values()].sort((a, b) => b.count - a.count);
+  }, [filtered]);
+  const failureStats = useMemo(() => {
+    const grouped = new Map<string, { code: string; message: string; count: number }>();
+    filtered.filter((row) => row.status === "failed").forEach((row) => { const key = row.code || "UNKNOWN"; const item = grouped.get(key) || { code: key, message: row.error, count: 0 }; item.count += 1; grouped.set(key, item); });
+    return [...grouped.values()].sort((a, b) => b.count - a.count);
+  }, [filtered]);
+  const operatorStats = useMemo(() => operators.map((name) => { const own = filtered.filter((row) => row.shippedBy === name); return { name, total: own.length, shipped: own.filter((row) => row.status === "shipped").length }; }).filter((item) => item.total).sort((a, b) => b.total - a.total), [filtered, operators]);
+  const weeklyStats = useMemo(() => {
+    const today = startOfDay(new Date()); const currentMonday = addDays(today, -((today.getDay() + 6) % 7));
+    return Array.from({ length: 8 }, (_, index) => { const start = addDays(currentMonday, (index - 7) * 7); const end = addDays(start, 7); const own = filtered.filter((row) => { const time = Date.parse(row.createdAt); return time >= start.getTime() && time < end.getTime(); }); return { key: dayKey(start), label: `${start.toLocaleDateString(undefined, { day: "numeric", month: "short" })} – ${addDays(end, -1).toLocaleDateString(undefined, { day: "numeric", month: "short" })}`, shipped: own.filter((row) => row.status === "shipped").length, failed: own.filter((row) => row.status === "failed").length }; }).reverse();
+  }, [filtered]);
+  const monthlyStats = useMemo(() => {
+    const now = new Date();
+    return Array.from({ length: 6 }, (_, index) => { const start = new Date(now.getFullYear(), now.getMonth() + index - 5, 1); const end = new Date(start.getFullYear(), start.getMonth() + 1, 1); const own = filtered.filter((row) => { const time = Date.parse(row.createdAt); return time >= start.getTime() && time < end.getTime(); }); return { key: `${start.getFullYear()}-${start.getMonth()}`, label: start.toLocaleDateString(undefined, { month: "long", year: "numeric" }), shipped: own.filter((row) => row.status === "shipped").length, failed: own.filter((row) => row.status === "failed").length }; }).reverse();
+  }, [filtered]);
+
+  function exportAnalytics() {
+    const quote = (value: string | number | boolean) => `"${String(value).replace(/"/g, '""')}"`;
+    const header = ["date_time", "status", "order_number", "order_id", "awb", "courier", "shipping_cost", "already_booked", "failure_code", "failure_reason", "batch_id", "shipped_by"];
+    const data = filtered.map((row) => [row.createdAt, row.status, row.orderNumber, row.orderId, row.awb, row.courier, row.cost, row.alreadyBooked, row.code, row.error, row.batchId, row.shippedBy].map(quote).join(","));
+    downloadFile(`autoship-analytics-${dayKey(new Date())}.csv`, [header.join(","), ...data].join("\n"), "text/csv;charset=utf-8");
+  }
+  const resetFilters = () => { setRange("all"); setFrom(""); setTo(""); setQuery(""); setStatus("all"); setCourier("all"); setOperator("all"); };
+
+  if (loading) return <div className="analytics-loading"><LoaderCircle className="spin" /><span>Calculating every shipment metric...</span></div>;
+  if (error) return <div className="alert error"><AlertTriangle />{error}</div>;
+  return <>
+    <div className="page-heading analytics-heading"><div><p className="eyebrow">Complete visibility</p><h1>Analytics</h1><p>Every order, outcome, courier, cost, operator, and date range in one view.</p></div><button className="button primary" onClick={exportAnalytics} disabled={!filtered.length}><Download /> Export {filtered.length} rows</button></div>
+
+    <section className="card analytics-filter-card">
+      <div className="filter-title"><span><Filter /> Filters</span><button onClick={resetFilters}>Reset all</button></div>
+      <div className="quick-ranges" aria-label="Date range">{([['all','All time'],['today','Today'],['yesterday','Yesterday'],['day-before','Day before'],['tomorrow','Tomorrow'],['week','This week'],['month','This month'],['last-7','Last 7 days'],['last-30','Last 30 days'],['custom','Custom']] as [AnalyticsRange, string][]).map(([value, label]) => <button className={range === value ? "active" : ""} key={value} onClick={() => setRange(value)}>{label}</button>)}</div>
+      <div className="filter-grid">
+        <label className="search-filter"><span>Search anything</span><div><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Order, ID, AWB, batch, error..." /></div></label>
+        <label><span>Status</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">All statuses</option><option value="shipped">Shipped</option><option value="failed">Failed</option></select></label>
+        <label><span>Courier</span><select value={courier} onChange={(event) => setCourier(event.target.value)}><option value="all">All couriers</option>{couriers.map((item) => <option key={item}>{item}</option>)}</select></label>
+        <label><span>Operator</span><select value={operator} onChange={(event) => setOperator(event.target.value)}><option value="all">All operators</option>{operators.map((item) => <option key={item}>{item}</option>)}</select></label>
+        {range === "custom" && <><label><span>From date</span><input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label><span>To date</span><input type="date" min={from} value={to} onChange={(event) => setTo(event.target.value)} /></label></>}
+      </div>
+    </section>
+
+    <div className="metric-grid">
+      <article className="card metric-card"><span>Total orders</span><strong>{compactNumber.format(metrics.total)}</strong><small>{metrics.batchCount} batches in selection</small></article>
+      <article className="card metric-card shipped"><span>Shipped</span><strong>{compactNumber.format(metrics.shipped)}</strong><small>{metrics.success.toFixed(1)}% success rate</small></article>
+      <article className="card metric-card failed"><span>Failed</span><strong>{compactNumber.format(metrics.failed)}</strong><small>{metrics.total ? (metrics.failed / metrics.total * 100).toFixed(1) : "0.0"}% failure rate</small></article>
+      <article className="card metric-card"><span>Shipping spend</span><strong>{money.format(metrics.totalCost)}</strong><small>{money.format(metrics.averageCost)} average / shipped</small></article>
+    </div>
+
+    <section className="period-grid">{periodTotals.map((item) => <article className="card period-card" key={item.label}><div><span>{item.label}</span><small>{item.note}</small></div><strong>{item.value}</strong><em>shipped</em></article>)}</section>
+
+    <div className="analytics-grid">
+      <section className="card chart-card"><div className="analytics-section-title"><div><h2>14-day shipment trend</h2><p>Shipped versus failed orders using the active filters.</p></div><div className="chart-legend"><span><i className="success-dot" /> Shipped</span><span><i className="failure-dot" /> Failed</span></div></div><div className="bar-chart">{daily.map((point) => <div className="bar-column" key={point.key} title={`${point.key}: ${point.shipped} shipped, ${point.failed} failed`}><div className="bar-value">{point.shipped + point.failed || ""}</div><div className="bar-stack" style={{ height: `${Math.max(3, (point.shipped + point.failed) / chartMax * 150)}px` }}>{point.failed > 0 && <span className="failed-bar" style={{ flex: point.failed }} />}{point.shipped > 0 && <span className="shipped-bar" style={{ flex: point.shipped }} />}</div><small>{point.date.toLocaleDateString(undefined, { day: "numeric", month: "short" })}</small></div>)}</div></section>
+      <section className="card breakdown-card"><div className="analytics-section-title"><div><h2>Courier performance</h2><p>Volume and spend by courier.</p></div></div>{courierStats.length ? <div className="breakdown-list">{courierStats.map((item) => <div className="breakdown-row" key={item.name}><div><strong>{item.name}</strong><small>{money.format(item.cost)} spend</small></div><span>{item.count} shipped</span></div>)}</div> : <div className="mini-analytics-empty">No shipped orders match.</div>}</section>
+    </div>
+
+    <div className="analytics-grid lower">
+      <section className="card breakdown-card"><div className="analytics-section-title"><div><h2>Failure reasons</h2><p>Every error grouped by its response code.</p></div></div>{failureStats.length ? <div className="breakdown-list">{failureStats.map((item) => <div className="breakdown-row failure" key={item.code}><div><strong>{item.code}</strong><small>{item.message}</small></div><span>{item.count}</span></div>)}</div> : <div className="mini-analytics-empty success-text"><Check /> No failures match this view.</div>}</section>
+      <section className="card breakdown-card"><div className="analytics-section-title"><div><h2>Team output</h2><p>Orders processed and shipped by operator.</p></div></div>{operatorStats.length ? <div className="breakdown-list">{operatorStats.map((item) => <div className="breakdown-row" key={item.name}><div><strong>{item.name}</strong><small>{item.total ? (item.shipped / item.total * 100).toFixed(1) : 0}% success rate</small></div><span>{item.shipped} / {item.total}</span></div>)}</div> : <div className="mini-analytics-empty">No operator activity matches.</div>}</section>
+    </div>
+
+    <div className="analytics-grid lower">
+      <section className="card breakdown-card rollup-card"><div className="analytics-section-title"><div><h2>Weekly rollup</h2><p>Shipped and failed totals for each of the last 8 weeks.</p></div></div><div className="breakdown-list">{weeklyStats.map((item) => <div className="breakdown-row" key={item.key}><strong>{item.label}</strong><div className="rollup-values"><span>{item.shipped} shipped</span><em>{item.failed} failed</em></div></div>)}</div></section>
+      <section className="card breakdown-card rollup-card"><div className="analytics-section-title"><div><h2>Monthly rollup</h2><p>Shipped and failed totals for each of the last 6 months.</p></div></div><div className="breakdown-list">{monthlyStats.map((item) => <div className="breakdown-row" key={item.key}><strong>{item.label}</strong><div className="rollup-values"><span>{item.shipped} shipped</span><em>{item.failed} failed</em></div></div>)}</div></section>
+    </div>
+
+    <section className="card analytics-table-card"><div className="analytics-section-title table-title"><div><h2>Order-level ledger</h2><p>{filtered.length} matching records · newest first · all times shown in your local timezone</p></div><button className="button secondary" onClick={exportAnalytics} disabled={!filtered.length}><Download /> CSV</button></div>{filtered.length ? <div className="analytics-table-wrap"><table><thead><tr><th>Date & time</th><th>Status</th><th>Order</th><th>Order ID</th><th>AWB</th><th>Courier / error</th><th>Cost</th><th>Operator</th><th>Batch ID</th></tr></thead><tbody>{filtered.map((row) => <tr key={row.key}><td><strong>{new Date(row.createdAt).toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" })}</strong><small>{new Date(row.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</small></td><td><span className={`analytics-status ${row.status}`}>{row.status}</span></td><td><strong>{row.orderNumber}</strong>{row.alreadyBooked && <small>Already booked</small>}</td><td>{row.orderId || "—"}</td><td>{row.awb || "—"}</td><td>{row.status === "shipped" ? row.courier : <span className="table-error"><strong>{row.code}</strong><small>{row.error}</small></span>}</td><td>{row.status === "shipped" ? money.format(row.cost) : "—"}</td><td>{row.shippedBy}</td><td><code title={row.batchId}>{row.batchId.slice(0, 8)}...</code></td></tr>)}</tbody></table></div> : <div className="empty-state analytics-empty"><BarChart3 /><strong>No records match these filters</strong><span>Change the date range or clear one of the filters.</span><button className="button secondary" onClick={resetFilters}>Reset filters</button></div>}</section>
+  </>;
 }
 
 function HistoryPage() {
