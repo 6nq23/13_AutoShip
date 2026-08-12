@@ -1,13 +1,28 @@
 import path from "node:path";
 import fs from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
+import { waitUntil } from "@vercel/functions";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
+import {
+  contentSecurityPolicy,
+  crossOriginOpenerPolicy,
+  originAgentCluster,
+  referrerPolicy,
+  strictTransportSecurity,
+  xContentTypeOptions,
+  xDnsPrefetchControl,
+  xDownloadOptions,
+  xFrameOptions,
+  xPermittedCrossDomainPolicies,
+  xXssProtection,
+} from "helmet";
+import { rateLimit } from "express-rate-limit";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { PrismaStore, type Store } from "./store.js";
+import { loadConfig } from "./config.js";
 import { NimbusClient } from "./nimbus.js";
 import type { Batch, NimbusProgressEvent, Role, ShippingJob, ShippingLog } from "./types.js";
 
@@ -22,7 +37,21 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
   const nimbus = new NimbusClient({ apiUrl: config.nimbusApiUrl, apiKey: config.nimbusApiKey, apiSecret: config.nimbusApiSecret, maxPages: config.maxLookupPages, mockMode: config.mockMode }, { getOrderId: (order) => store.getOrderId(order), cacheOrder: (order, id) => store.cacheOrder(order, id) });
   const app = express();
   app.set("trust proxy", 1);
-  app.disable("x-powered-by"); app.use(helmet({ crossOriginResourcePolicy: false })); app.use(cors({ origin: config.clientOrigin, credentials: false })); app.use(express.json({ limit: "32kb" }));
+  app.disable("x-powered-by");
+  app.use(
+    contentSecurityPolicy(),
+    crossOriginOpenerPolicy(),
+    originAgentCluster(),
+    referrerPolicy(),
+    strictTransportSecurity(),
+    xContentTypeOptions(),
+    xDnsPrefetchControl(),
+    xDownloadOptions(),
+    xFrameOptions(),
+    xPermittedCrossDomainPolicies(),
+    xXssProtection(),
+  );
+  app.use(cors({ origin: config.clientOrigin, credentials: false })); app.use(express.json({ limit: "32kb" }));
   const authenticate = (request: AuthRequest, response: Response, next: NextFunction) => { const token = request.headers.authorization?.replace(/^Bearer\s+/i, ""); if (!token) return response.status(401).json({ error: "Please sign in to continue." }); try { request.auth = jwt.verify(token, config.jwtSecret) as { username: string; role: Role }; next(); } catch { response.status(401).json({ error: "Your session has expired. Please sign in again." }); } };
   const adminOnly = (request: AuthRequest, response: Response, next: NextFunction) => request.auth?.role === "admin" ? next() : response.status(403).json({ error: "Admin access is required." });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: "draft-7", legacyHeaders: false });
@@ -121,4 +150,23 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
   app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => { console.error(error); response.status(500).json({ error: "The request could not be completed. Please try again." }); });
   for (const pendingJob of await store.getPendingShippingJobs()) runInBackground(processJob(pendingJob.jobId));
   return app;
+}
+
+let serverlessAppPromise: ReturnType<typeof createApp> | undefined;
+
+/**
+ * Vercel's Express auto-detection treats src/app.ts as a function entrypoint.
+ * Keep initialization lazy so importing this module during the build does not
+ * connect to PostgreSQL, and reuse the Express app across warm invocations.
+ */
+export default async function handler(request: IncomingMessage, response: ServerResponse) {
+  if (!serverlessAppPromise) {
+    serverlessAppPromise = createApp(loadConfig(), undefined, (task) => waitUntil(task)).catch((error) => {
+      serverlessAppPromise = undefined;
+      throw error;
+    });
+  }
+
+  const app = await serverlessAppPromise;
+  return app(request, response);
 }

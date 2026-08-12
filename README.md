@@ -135,6 +135,8 @@ MOCK_MODE=false
 
 The localhost database URL is only for local development: a Vercel function cannot connect to PostgreSQL running on your computer. Use a hosted PostgreSQL URL for Preview and Production, then apply `server/prisma/migrations` to that database before serving traffic.
 
+The production client uses `VITE_API_URL=https://auto-ship-backend.vercel.app` from `client/.env.production`. Local development leaves the base URL empty and continues using Vite's `/api` proxy to `http://localhost:8787`.
+
 Vercel function execution is capped at the configured 300 seconds. Very large or slow live shipment batches should eventually move to a durable queue/worker so they are not interrupted by the function timeout.
 
 ## Courier priority

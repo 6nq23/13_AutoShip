@@ -8,6 +8,7 @@ export type HistoryItem = ShipResult & { createdAt: string; shippedBy: string };
 export type ShippingJob = { jobId: string; createdAt: string; updatedAt: string; createdBy: string; status: "queued" | "processing" | "completed" | "failed"; orderNumbers: string[]; processed: number; total: number; shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; logs: ShippingLog[]; error?: string; result?: ShipResult };
 
 const TOKEN_KEY = "autoship_token";
+const API_BASE_URL = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
 export const getToken = () => localStorage.getItem(TOKEN_KEY);
 export const setToken = (token: string) => localStorage.setItem(TOKEN_KEY, token);
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
@@ -17,7 +18,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body) headers.set("Content-Type", "application/json");
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(path, { ...init, headers });
+  const response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || "Something went wrong. Please try again.");
   return body;
