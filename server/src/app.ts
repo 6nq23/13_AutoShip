@@ -1,4 +1,5 @@
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
@@ -6,17 +7,21 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
-import { PostgresStore, type Store } from "./store.js";
+import { PrismaStore, type Store } from "./store.js";
 import { NimbusClient } from "./nimbus.js";
 import type { Batch, NimbusProgressEvent, Role, ShippingJob, ShippingLog } from "./types.js";
 
 type AuthRequest = Request & { auth?: { username: string; role: Role } };
 export type AppConfig = { jwtSecret: string; clientOrigin: string; databaseUrl: string; databaseSsl: boolean; mockMode: boolean; initialAdminPassword?: string; nimbusApiUrl: string; nimbusApiKey: string; nimbusApiSecret: string; maxLookupPages: number };
 
-export async function createApp(config: AppConfig, storeOverride?: Store) {
-  const store = storeOverride || new PostgresStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword); await store.init();
+type BackgroundScheduler = (task: Promise<void>) => void;
+
+export async function createApp(config: AppConfig, storeOverride?: Store, scheduleBackground?: BackgroundScheduler) {
+  const store = storeOverride || new PrismaStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword); await store.init();
+  const runInBackground: BackgroundScheduler = scheduleBackground || ((task) => { void task.catch((error) => console.error("Background task failed", error)); });
   const nimbus = new NimbusClient({ apiUrl: config.nimbusApiUrl, apiKey: config.nimbusApiKey, apiSecret: config.nimbusApiSecret, maxPages: config.maxLookupPages, mockMode: config.mockMode }, { getOrderId: (order) => store.getOrderId(order), cacheOrder: (order, id) => store.cacheOrder(order, id) });
   const app = express();
+  app.set("trust proxy", 1);
   app.disable("x-powered-by"); app.use(helmet({ crossOriginResourcePolicy: false })); app.use(cors({ origin: config.clientOrigin, credentials: false })); app.use(express.json({ limit: "32kb" }));
   const authenticate = (request: AuthRequest, response: Response, next: NextFunction) => { const token = request.headers.authorization?.replace(/^Bearer\s+/i, ""); if (!token) return response.status(401).json({ error: "Please sign in to continue." }); try { request.auth = jwt.verify(token, config.jwtSecret) as { username: string; role: Role }; next(); } catch { response.status(401).json({ error: "Your session has expired. Please sign in again." }); } };
   const adminOnly = (request: AuthRequest, response: Response, next: NextFunction) => request.auth?.role === "admin" ? next() : response.status(403).json({ error: "Admin access is required." });
@@ -36,7 +41,7 @@ export async function createApp(config: AppConfig, storeOverride?: Store) {
     if (runningJobs.has(jobId)) return; runningJobs.add(jobId);
     let job: ShippingJob | undefined;
     try {
-      job = await store.getShippingJob(jobId); if (!job || job.status === "completed" || job.status === "failed") return;
+      job = await store.claimShippingJob(jobId); if (!job || job.status === "completed" || job.status === "failed") return;
       if (job.status === "processing" && job.processed > 0) { job.processed = 0; job.shipped = []; job.failed = []; job.labelUrl = null; appendLog(job, "info", "Server restarted; safely rechecking every order before continuing."); }
       job.status = "processing"; appendLog(job, "info", `Shipment started for ${job.total} order${job.total === 1 ? "" : "s"}.`); await store.updateShippingJob(job);
       let persistence = Promise.resolve();
@@ -87,7 +92,7 @@ export async function createApp(config: AppConfig, storeOverride?: Store) {
       const active = await store.getActiveShippingJob(request.auth!.username); if (active) return response.status(409).json({ error: "A shipment is already running for this account.", job: active });
       const now = new Date().toISOString(); const job: ShippingJob = { jobId: crypto.randomUUID(), createdAt: now, updatedAt: now, createdBy: request.auth!.username, status: "queued", orderNumbers, processed: 0, total: orderNumbers.length, shipped: [], failed: [], labelUrl: null, logs: [{ at: now, level: "info", message: `Shipment job created for ${orderNumbers.length} order${orderNumbers.length === 1 ? "" : "s"}.` }] };
       if (!(await store.createShippingJob(job))) { const existing = await store.getActiveShippingJob(request.auth!.username); return response.status(409).json({ error: "A shipment is already running for this account.", job: existing }); }
-      response.status(202).json({ job }); void processJob(job.jobId);
+      response.status(202).json({ job }); runInBackground(processJob(job.jobId));
     } catch (error) { next(error); }
   });
   app.get("/api/shipping-jobs/active", authenticate, async (request: AuthRequest, response, next) => { try { response.json({ job: await store.getActiveShippingJob(request.auth!.username) || null }); } catch (error) { next(error); } });
@@ -106,8 +111,14 @@ export async function createApp(config: AppConfig, storeOverride?: Store) {
   app.get("/api/settings/status", authenticate, adminOnly, (_request, response) => response.json({ connected: !config.mockMode && Boolean(config.nimbusApiKey && config.nimbusApiSecret), demoMode: config.mockMode, apiUrl: config.nimbusApiUrl, database: "PostgreSQL" }));
   app.get("/demo-labels", (_request, response) => response.type("html").send("<title>AutoShip demo labels</title><style>body{font-family:system-ui;padding:40px}code{font-size:18px}</style><h1>Demo label bundle</h1><p>Live mode returns NimbusPost’s merged PDF here.</p>"));
 
-  const clientDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../client/dist"); app.use(express.static(clientDist)); app.get("*", (request, response, next) => request.path.startsWith("/api/") ? next() : response.sendFile(path.join(clientDist, "index.html")));
+  const clientDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../client/dist");
+  if (fs.existsSync(path.join(clientDist, "index.html"))) {
+    app.use(express.static(clientDist));
+    app.get("*", (request, response, next) => request.path.startsWith("/api/") ? next() : response.sendFile(path.join(clientDist, "index.html")));
+  } else {
+    app.get("/", (_request, response) => response.json({ message: "AutoShip API", health: "/api/health" }));
+  }
   app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => { console.error(error); response.status(500).json({ error: "The request could not be completed. Please try again." }); });
-  for (const pendingJob of await store.getPendingShippingJobs()) void processJob(pendingJob.jobId);
+  for (const pendingJob of await store.getPendingShippingJobs()) runInBackground(processJob(pendingJob.jobId));
   return app;
 }

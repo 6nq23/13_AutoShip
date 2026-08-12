@@ -7,9 +7,9 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["src"],
+  "include": ["src", "api", "init-db.ts"],
   "exclude": ["src/**/*.test.ts"]
 }

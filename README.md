@@ -1,6 +1,31 @@
 # AutoShip
 
-AutoShip turns `RBD` order QR codes into booked NimbusPost shipments and one merged label bundle. The React PWA talks to an Express API; PostgreSQL stores users, cached NimbusPost order IDs, and shipping history.
+AutoShip turns `RBD` order QR codes into booked NimbusPost shipments and one merged label bundle. The React PWA talks to an Express API; Prisma and PostgreSQL store users, cached NimbusPost order IDs, shipping jobs, and shipping history. The backend can run locally or as one Vercel Node.js serverless function.
+
+## Prisma database
+
+The local development database is configured as:
+
+```dotenv
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/auto_aync_prisma?schema=public"
+```
+
+Create the database once, then apply the Prisma schema and seed the initial admin:
+
+```bash
+PGPASSWORD=postgres createdb -h localhost -U postgres auto_aync_prisma
+npm run init-db -w server
+```
+
+Useful Prisma commands:
+
+```bash
+npm run db:push -w server
+npm run db:studio -w server
+npm run db:generate -w server
+```
+
+The Prisma schema is in `server/prisma/schema.prisma`. It owns all four application tables: `users`, `order_cache`, `shipping_jobs`, and `shipping_batches`.
 
 ## First-time PostgreSQL setup (Windows)
 
@@ -10,11 +35,10 @@ PostgreSQL 18 is already running on this machine. Open PowerShell and connect as
 & "D:\07_EXE\PostgreSQL\18\bin\psql.exe" -U postgres -h localhost -d postgres -W
 ```
 
-Enter the PostgreSQL administrator password, then run these two SQL statements using a strong password of your choice:
+Enter the PostgreSQL administrator password, then create the local database if it does not already exist:
 
 ```sql
-CREATE USER autoship WITH PASSWORD 'replace_with_a_strong_password';
-CREATE DATABASE autoship OWNER autoship;
+CREATE DATABASE auto_aync_prisma;
 \q
 ```
 
@@ -26,14 +50,14 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Set `DATABASE_URL` in `.env` with the same password:
+Set `DATABASE_URL` in `.env`:
 
 ```dotenv
-DATABASE_URL=postgresql://autoship:YOUR_PASSWORD@localhost:5432/autoship
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/auto_aync_prisma?schema=public"
 DATABASE_SSL=false
 ```
 
-AutoShip creates its `users`, `order_cache`, and `shipping_batches` tables on the first server start.
+Run `npm run init-db -w server` after changing `DATABASE_URL`; Prisma creates the tables and the seed step creates the initial admin when the user table is empty.
 
 ## Start AutoShip
 
@@ -89,6 +113,29 @@ npm start
 ```
 
 Database and NimbusPost credentials stay on the server. The browser only talks to AutoShip’s authenticated `/api` routes.
+
+## Deploy the backend to Vercel
+
+Create a Vercel project with `server` as its Root Directory. `server/vercel.json` routes every request to the Express function at `server/api/index.ts`; Prisma Client is generated during install/build. Shipment jobs are registered with Vercel `waitUntil()` so the existing `202` response and frontend polling flow continue to work after the response is sent.
+
+Set these Vercel environment variables:
+
+```dotenv
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE?schema=public
+DATABASE_SSL=true
+CLIENT_ORIGIN=https://your-frontend.example
+JWT_SECRET=a-random-secret-at-least-32-characters-long
+INITIAL_ADMIN_PASSWORD=a-strong-initial-password
+NIMBUS_API_KEY=npk_your_key
+NIMBUS_API_SECRET=your_secret
+NIMBUS_API_URL=https://api-v2.nimbuspost.com
+NIMBUS_LOOKUP_MAX_PAGES=20
+MOCK_MODE=false
+```
+
+The localhost database URL is only for local development: a Vercel function cannot connect to PostgreSQL running on your computer. Use a hosted PostgreSQL URL for Preview and Production, then apply `server/prisma/migrations` to that database before serving traffic.
+
+Vercel function execution is capped at the configured 300 seconds. Very large or slow live shipment batches should eventually move to a durable queue/worker so they are not interrupted by the function timeout.
 
 ## Courier priority
 

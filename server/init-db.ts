@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-import { PostgresStore } from "./src/store.js";
+import { PrismaStore } from "./src/store.js";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -17,16 +17,14 @@ async function initDb() {
   const initialPassword = process.env.INITIAL_ADMIN_PASSWORD || "admin123";
 
   console.log("Connecting to database...");
-  const store = new PostgresStore(dbUrl, ssl, false, initialPassword);
+  const store = new PrismaStore(dbUrl, ssl, false, initialPassword);
 
   try {
-    console.log("Initializing database tables...");
+    console.log("Seeding the initial admin account...");
     await store.init();
-    console.log("Database initialized successfully!");
+    console.log("Database seed completed successfully!");
   } catch (error) {
     console.error("Failed to initialize database:", error);
-  } finally {
-    await store.close();
   }
 }
 
