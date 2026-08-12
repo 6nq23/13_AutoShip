@@ -123,7 +123,7 @@ Set these Vercel environment variables:
 ```dotenv
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE?schema=public
 DATABASE_SSL=true
-CLIENT_ORIGIN=https://your-frontend.example
+CLIENT_ORIGIN=http://localhost:5173,https://auto-ship-client.vercel.app
 JWT_SECRET=a-random-secret-at-least-32-characters-long
 INITIAL_ADMIN_PASSWORD=a-strong-initial-password
 NIMBUS_API_KEY=npk_your_key
