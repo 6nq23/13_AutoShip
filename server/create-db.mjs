@@ -3,7 +3,7 @@ import pg from "pg";
 
 const client = new pg.Client({
   user: "postgres",
-  password: "Pp23101614 ",
+  password: "postgres",
   host: "localhost",
   port: 5432,
   database: "postgres", // connect to default db first
