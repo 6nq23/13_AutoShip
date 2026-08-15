@@ -31,3 +31,82 @@ export type NimbusProgressEvent =
   | { type: "labels_ready"; labelUrl: string }
   | { type: "labels_failed"; error: string };
 export type OrderMatch = { order_id: string; order_number: string; order_status?: string; shipment?: { awb?: string; courier_name?: string; price?: { total?: number }; label_url?: string } };
+
+export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return";
+export type ConversationStep = "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice";
+export type SupportConversation = {
+  phone: string;
+  intent?: SupportIntent;
+  step: ConversationStep;
+  context: Record<string, unknown>;
+  updatedAt: string;
+  expiresAt: string;
+};
+export type WhatsAppMessage = {
+  id: string;
+  phone: string;
+  direction: "inbound" | "outbound";
+  text: string;
+  intent?: SupportIntent;
+  orderNumber?: string;
+  providerMessageId?: string;
+  createdAt: string;
+};
+export type SupportTicketStatus = "open" | "resolved";
+export type SupportTicket = {
+  ticketId: string;
+  phone: string;
+  orderNumber?: string;
+  category: "refund" | "return" | "missing" | "other";
+  description?: string;
+  status: SupportTicketStatus;
+  createdAt: string;
+  resolvedAt?: string;
+};
+export type SupportOverview = {
+  messages: WhatsAppMessage[];
+  tickets: SupportTicket[];
+  conversations: SupportConversation[];
+  stats: { inboundToday: number; outboundToday: number; activeConversations: number; openTickets: number };
+};
+
+export type ShopifyAddress = {
+  name?: string;
+  firstName?: string;
+  lastName?: string;
+  phone?: string;
+  address1: string;
+  address2?: string;
+  city: string;
+  province?: string;
+  provinceCode?: string;
+  zip: string;
+  country?: string;
+  countryCode?: string;
+};
+export type ShopifyOrder = {
+  id: string;
+  name: string;
+  createdAt: string;
+  displayFinancialStatus?: string;
+  displayFulfillmentStatus?: string;
+  totalAmount: string;
+  currencyCode: string;
+  shippingAddress?: ShopifyAddress;
+  customerPhones?: string[];
+  lineItems: Array<{ title: string; quantity: number; sku?: string }>;
+};
+export type NimbusTracking = {
+  orderId?: string;
+  orderNumber?: string;
+  orderStatus?: string;
+  shipment?: { awb?: string; courierName?: string; edd?: string; pickedAt?: string };
+  latest?: { shipStatus?: string; eventTime?: string; location?: string; message?: string };
+};
+export type NimbusNdr = {
+  awb: string;
+  attempt_count?: number;
+  last_attempt_date?: string;
+  remarks?: string;
+  available_actions?: string[];
+};

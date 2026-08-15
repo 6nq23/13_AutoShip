@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { IScannerControls } from "@zxing/browser";
-import { AlertTriangle, BarChart3, Box, CalendarDays, Camera, Check, ChevronRight, CircleUserRound, Clock3, Database, Download, Filter, History, Keyboard, LoaderCircle, LogOut, PackageCheck, Plus, RefreshCw, ScanLine, Search, Settings, ShieldCheck, Trash2, Truck } from "lucide-react";
-import { api, clearToken, getToken, HistoryItem, normalizeOrder, setToken, ShipResult, ShippingJob, ShippingLog, User } from "./api";
+import { AlertTriangle, BarChart3, Box, CalendarDays, Camera, Check, ChevronRight, CircleUserRound, Clock3, Database, Download, Filter, History, Inbox, Keyboard, LoaderCircle, LogOut, MessageCircle, PackageCheck, Plus, RefreshCw, ScanLine, Search, Settings, ShieldCheck, TicketCheck, Trash2, Truck, Users } from "lucide-react";
+import { api, clearToken, getToken, HistoryItem, normalizeOrder, setToken, ShipResult, ShippingJob, ShippingLog, SupportOverview, User } from "./api";
 
-type Tab = "scan" | "history" | "analytics" | "settings";
+type Tab = "scan" | "history" | "analytics" | "support" | "settings";
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -73,17 +73,19 @@ function Workspace({ user, demoMode, onLogout }: { user: User; demoMode: boolean
         <NavButton active={tab === "scan"} onClick={() => setTab("scan")} icon={<ScanLine />}>Ship orders</NavButton>
         <NavButton active={tab === "history"} onClick={() => setTab("history")} icon={<History />}>History</NavButton>
         <NavButton active={tab === "analytics"} onClick={() => setTab("analytics")} icon={<BarChart3 />}>Analytics</NavButton>
+        {user.role === "admin" && <NavButton active={tab === "support"} onClick={() => setTab("support")} icon={<MessageCircle />}>Support</NavButton>}
         {user.role === "admin" && <NavButton active={tab === "settings"} onClick={() => setTab("settings")} icon={<Settings />}>Settings</NavButton>}
       </nav>
       <div className="profile"><div className="avatar">{user.username.slice(0, 2).toUpperCase()}</div><div><strong>{user.username}</strong><small>{user.role}</small></div><button aria-label="Sign out" onClick={onLogout}><LogOut /></button></div>
     </aside>
     <header className="mobile-header"><div className="brand-mark"><Truck size={20} /> AutoShip</div><button onClick={onLogout} aria-label="Sign out"><LogOut /></button></header>
     {demoMode && <div className="demo-banner"><span>Demo mode</span> Try RBD4023, RBD4030, RBD4035, and RBD4044</div>}
-    <main className="workspace">{tab === "scan" ? <ShipWorkspace /> : tab === "history" ? <HistoryPage /> : tab === "analytics" ? <AnalyticsPage /> : <SettingsPage />}</main>
+    <main className="workspace">{tab === "scan" ? <ShipWorkspace /> : tab === "history" ? <HistoryPage /> : tab === "analytics" ? <AnalyticsPage /> : tab === "support" ? <SupportPage /> : <SettingsPage />}</main>
     <nav className="bottom-nav" aria-label="Mobile navigation">
       <NavButton active={tab === "scan"} onClick={() => setTab("scan")} icon={<ScanLine />}>Ship</NavButton>
       <NavButton active={tab === "history"} onClick={() => setTab("history")} icon={<History />}>History</NavButton>
       <NavButton active={tab === "analytics"} onClick={() => setTab("analytics")} icon={<BarChart3 />}>Analytics</NavButton>
+      {user.role === "admin" && <NavButton active={tab === "support"} onClick={() => setTab("support")} icon={<MessageCircle />}>Support</NavButton>}
       {user.role === "admin" && <NavButton active={tab === "settings"} onClick={() => setTab("settings")} icon={<Settings />}>Settings</NavButton>}
     </nav>
   </div>;
@@ -407,6 +409,52 @@ function AnalyticsPage() {
     <section className="card analytics-table-card"><div className="analytics-section-title table-title"><div><h2>Order-level ledger</h2><p>{filtered.length} matching records · newest first · all times shown in your local timezone</p></div><button className="button secondary" onClick={exportAnalytics} disabled={!filtered.length}><Download /> CSV</button></div>{filtered.length ? <div className="analytics-table-wrap"><table><thead><tr><th>Date & time</th><th>Status</th><th>Order</th><th>Order ID</th><th>AWB</th><th>Courier / error</th><th>Cost</th><th>Operator</th><th>Batch ID</th></tr></thead><tbody>{filtered.map((row) => <tr key={row.key}><td><strong>{new Date(row.createdAt).toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" })}</strong><small>{new Date(row.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</small></td><td><span className={`analytics-status ${row.status}`}>{row.status}</span></td><td><strong>{row.orderNumber}</strong>{row.alreadyBooked && <small>Already booked</small>}</td><td>{row.orderId || "—"}</td><td>{row.awb || "—"}</td><td>{row.status === "shipped" ? row.courier : <span className="table-error"><strong>{row.code}</strong><small>{row.error}</small></span>}</td><td>{row.status === "shipped" ? money.format(row.cost) : "—"}</td><td>{row.shippedBy}</td><td><code title={row.batchId}>{row.batchId.slice(0, 8)}...</code></td></tr>)}</tbody></table></div> : <div className="empty-state analytics-empty"><BarChart3 /><strong>No records match these filters</strong><span>Change the date range or clear one of the filters.</span><button className="button secondary" onClick={resetFilters}>Reset filters</button></div>}</section>
   </>;
 }
+
+function SupportPage() {
+  const [overview, setOverview] = useState<SupportOverview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [ticketFilter, setTicketFilter] = useState<"open" | "resolved" | "all">("open");
+  const load = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setLoading(true);
+    try { setOverview(await api.supportOverview()); setError(""); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Support activity could not be loaded."); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { void load(true); const timer = window.setInterval(() => void load(), 5_000); return () => window.clearInterval(timer); }, [load]);
+
+  async function setTicketStatus(ticketId: string, status: "open" | "resolved") {
+    try {
+      await api.updateSupportTicket(ticketId, status);
+      setOverview((current) => current ? { ...current, tickets: current.tickets.map((ticket) => ticket.ticketId === ticketId ? { ...ticket, status, resolvedAt: status === "resolved" ? new Date().toISOString() : undefined } : ticket), stats: { ...current.stats, openTickets: current.stats.openTickets + (status === "open" ? 1 : -1) } } : current);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Ticket status could not be updated."); }
+  }
+
+  if (loading) return <div className="analytics-loading"><LoaderCircle className="spin" /><span>Loading WhatsApp support activity...</span></div>;
+  if (!overview) return <div className="alert error"><AlertTriangle />{error || "Support data is unavailable."}</div>;
+  const tickets = overview.tickets.filter((ticket) => ticketFilter === "all" || ticket.status === ticketFilter);
+  const connectionEntries = Object.entries(overview.connections) as Array<[keyof SupportOverview["connections"], boolean]>;
+  return <>
+    <div className="page-heading support-heading"><div><p className="eyebrow">Customer care</p><h1>WhatsApp support</h1><p>Live conversations, automation health, and escalated tickets in one place.</p></div><button className="button secondary" onClick={() => void load(true)}><RefreshCw /> Refresh</button></div>
+    {error && <div className="alert error" role="alert"><AlertTriangle />{error}</div>}
+    <div className="connection-strip" aria-label="Support connections">{connectionEntries.map(([name, connected]) => <span className={connected ? "connection connected" : "connection disconnected"} key={name}><i />{name} {connected ? "ready" : "needs setup"}</span>)}</div>
+    <div className="metric-grid support-metrics">
+      <article className="card metric-card"><span>Inbound today</span><strong>{overview.stats.inboundToday}</strong><small>Customer messages received</small></article>
+      <article className="card metric-card shipped"><span>Bot replies today</span><strong>{overview.stats.outboundToday}</strong><small>Automated responses sent</small></article>
+      <article className="card metric-card"><span>Active flows</span><strong>{overview.stats.activeConversations}</strong><small>Conversations awaiting input</small></article>
+      <article className="card metric-card failed"><span>Open tickets</span><strong>{overview.stats.openTickets}</strong><small>Human follow-up required</small></article>
+    </div>
+    <div className="support-grid">
+      <section className="card support-panel message-panel"><div className="support-panel-title"><div><MessageCircle /><span><h2>Live message feed</h2><p>Newest first · refreshes every 5 seconds</p></span></div><span className="count-pill">{overview.messages.length}</span></div>{overview.messages.length ? <div className="message-feed" aria-live="polite">{overview.messages.map((message) => <article className={`support-message ${message.direction}`} key={message.id}><div><strong>{message.direction === "inbound" ? formatPhone(message.phone) : "AutoShip bot"}</strong><time>{new Date(message.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></div><p>{message.text}</p><footer>{message.intent && <span>{friendlyIntent(message.intent)}</span>}{message.orderNumber && <span>{message.orderNumber}</span>}</footer></article>)}</div> : <SupportEmpty icon={<Inbox />} title="No WhatsApp messages yet" detail="Incoming webhook messages and bot replies will appear here." />}</section>
+      <section className="card support-panel ticket-panel"><div className="support-panel-title"><div><TicketCheck /><span><h2>Escalated tickets</h2><p>Refund, return, missing-item, and recovery work</p></span></div></div><div className="ticket-filters" aria-label="Ticket filter">{(["open", "resolved", "all"] as const).map((filter) => <button className={ticketFilter === filter ? "active" : ""} onClick={() => setTicketFilter(filter)} key={filter}>{filter}</button>)}</div>{tickets.length ? <div className="ticket-list">{tickets.map((ticket) => <article className="support-ticket" key={ticket.ticketId}><header><span className={`ticket-status ${ticket.status}`}>{ticket.status}</span><time>{new Date(ticket.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></header><strong>{ticket.orderNumber || "Order not identified"}</strong><p>{ticket.description || friendlyIntent("refund_return")}</p><div><span>{formatPhone(ticket.phone)}</span><span>{ticket.category}</span></div><button className="button secondary" onClick={() => void setTicketStatus(ticket.ticketId, ticket.status === "open" ? "resolved" : "open")}>{ticket.status === "open" ? <><Check /> Mark resolved</> : <><RefreshCw /> Reopen</>}</button></article>)}</div> : <SupportEmpty icon={<TicketCheck />} title={`No ${ticketFilter === "all" ? "" : `${ticketFilter} `}tickets`} detail="Escalations created by the bot will appear here." />}</section>
+    </div>
+    <section className="card support-panel conversation-panel"><div className="support-panel-title"><div><Users /><span><h2>Active conversation states</h2><p>Flows waiting for a customer reply; each expires after 24 hours.</p></span></div><span className="count-pill">{overview.conversations.length}</span></div>{overview.conversations.length ? <div className="conversation-list">{overview.conversations.map((conversation) => <article key={conversation.phone}><span className="conversation-avatar">{conversation.phone.slice(-2)}</span><div><strong>{formatPhone(conversation.phone)}</strong><small>{conversation.intent ? friendlyIntent(conversation.intent) : "Choosing a support topic"}</small></div><span>{conversation.step.replace(/_/g, " ")}</span><time>expires {new Date(conversation.expiresAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></article>)}</div> : <SupportEmpty icon={<Users />} title="No active conversations" detail="All current customer flows are complete or expired." />}</section>
+  </>;
+}
+
+function SupportEmpty({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) { return <div className="support-empty">{icon}<strong>{title}</strong><span>{detail}</span></div>; }
+const friendlyIntent = (intent: string) => ({ confirm_order: "Order confirmation", change_address: "Address / phone change", order_status: "Order tracking", not_dispatched: "Dispatch delay", order_failed: "Failed delivery", refund_return: "Refund / return / missing" } as Record<string, string>)[intent] || intent.replace(/_/g, " ");
+const formatPhone = (phone: string) => phone.length === 10 ? `+91 ${phone.slice(0, 5)} ${phone.slice(5)}` : `+${phone}`;
 
 function HistoryPage() {
   const [items, setItems] = useState<HistoryItem[]>([]); const [loading, setLoading] = useState(true);

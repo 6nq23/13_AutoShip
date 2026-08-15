@@ -33,7 +33,7 @@ DATABASE_URL=postgresql://autoship:YOUR_PASSWORD@localhost:5432/autoship
 DATABASE_SSL=false
 ```
 
-AutoShip creates its `users`, `order_cache`, and `shipping_batches` tables on the first server start.
+AutoShip creates its user, shipping, WhatsApp conversation/message, and support-ticket tables on the first server start.
 
 ## Start AutoShip
 
@@ -89,6 +89,18 @@ npm start
 ```
 
 Database and NimbusPost credentials stay on the server. The browser only talks to AutoShip’s authenticated `/api` routes.
+
+## WhatsApp customer support
+
+Admins have a **Support** tab for live message activity, active automation flows, integration readiness, and escalated refund/return/missing-item tickets. Configure Shopify, NimbusPost, and one WhatsApp provider in `.env`; use `.env.example` as the key reference. Shopify Admin GraphQL uses API version `2026-07` and needs order/customer read access, order write access, and protected customer-data access for phone and address fields.
+
+Point the provider webhook at `POST /api/whatsapp/webhook`:
+
+- Meta: set `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_VERIFY_TOKEN`, and `WHATSAPP_APP_SECRET`. Meta challenge verification and `X-Hub-Signature-256` validation are enabled.
+- Whapi.Cloud: set `WHATSAPP_API_KEY` (or `WHATSAPP_ACCESS_TOKEN`) and optionally a separate `WHATSAPP_VERIFY_TOKEN`. In the Whapi.Cloud channel webhook settings, add a custom callback header named `x-autoship-webhook-token`; its value must be the verify token, or the API/access token when no separate verify token is set.
+- Getgabs: set `WHATSAPP_PROVIDER=getgabs`, `WHATSAPP_API_KEY`, `WHATSAPP_API_URL`, `WHATSAPP_SENDER`, `WHATSAPP_CAMPAIGN_ID`, and a separate `WHATSAPP_VERIFY_TOKEN`. Configure the Getgabs incoming-chat webhook as `https://YOUR_AUTOSHIP_HOST/api/whatsapp/webhook?token=YOUR_VERIFY_TOKEN`. AutoShip sends dynamic bot responses through Getgabs' service-message endpoint during the open 24-hour customer-service window. To initiate an approved template message, also set `WHATSAPP_TEMPLATE_NAME` and optionally `WHATSAPP_TEMPLATE_LANGUAGE` (defaults to `en_US`).
+
+The bot supports order confirmation, address/phone changes with explicit confirmation, tracking, not-dispatched checks, NDR actions, and refund/return/missing-item escalation. Before exposing or changing an order, AutoShip verifies that the WhatsApp sender matches an order, shipping, billing, or customer phone in Shopify. Conversation state expires after 24 hours, provider message IDs are deduplicated, and all Support API routes are admin-only.
 
 ## Courier priority
 

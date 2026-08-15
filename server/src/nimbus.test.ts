@@ -80,4 +80,81 @@ describe("Nimbus courier priority", () => {
     expect(labelBodies).toEqual([{ order_ids: ["ORD-51"] }, { ids: ["ORD-51"] }]);
     expect(result.labelUrl).toBe("https://labels.test/51.pdf");
   });
+
+  it("paginates NDR records until it finds the requested AWB", async () => {
+    const pages: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input)); pages.push(url.searchParams.get("page") || "");
+      if (url.searchParams.get("page") === "1") return json({ success: true, data: Array.from({ length: 100 }, (_, index) => ({ awb: `AWB-${index}` })), meta: { pagination: { totalPages: 2 } } });
+      return json({ success: true, data: [{ awb: "AWB-TARGET", available_actions: ["rto"] }], meta: { pagination: { totalPages: 2 } } });
+    }));
+
+    await expect(makeClient().getNdr("AWB-TARGET")).resolves.toMatchObject({ awb: "AWB-TARGET", available_actions: ["rto"] });
+    expect(pages).toEqual(["1", "2"]);
+  });
+
+  it("restores the original Nimbus order when address replacement creation fails", async () => {
+    const createBodies: Array<Record<string, unknown>> = [];
+    let cachedOrderId = "";
+    const client = new NimbusClient(
+      { apiUrl: "https://nimbus.test", apiKey: "key", apiSecret: "secret", maxPages: 2, mockMode: false },
+      { getOrderId: async () => undefined, cacheOrder: async (_order, id) => { cachedOrderId = id; } },
+    );
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v2/orders" && url.search) return json({ success: true, data: [{ order_id: "ORD-OLD", order_number: "#RBD5001", order_status: "created" }] });
+      if (url.pathname === "/v2/orders/ORD-OLD" && !url.pathname.endsWith("/cancel")) return json({ success: true, data: { order_number: "#RBD5001", order_type: "forward", payment_mode: "prepaid", warehouse_id: "WH-1", shipping_address: { name: "Asha", address: "Old Road", pincode: 560001, city: "Bengaluru", state: "Karnataka", country: "India", phone: 9876543210 }, items: [{ name: "Rakhi", qty: 1 }], package: { weight: 0.5 } } });
+      if (url.pathname.endsWith("/cancel")) return json({ success: true, data: {} });
+      if (url.pathname === "/v2/orders" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>; createBodies.push(body);
+        if (createBodies.length === 1) return json({ error: { code: "VALIDATION_FAILED", detail: "New address rejected" } }, 422);
+        return json({ success: true, data: { order_id: "ORD-RESTORED", order_number: "#RBD5001", order_status: "created" } });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    await expect(client.replacePendingOrderAddress("#RBD5001", { address1: "New Road", city: "Kolkata", province: "West Bengal", zip: "700016", country: "India", phone: "9123456789" })).rejects.toThrow("restored the original order");
+    expect((createBodies[0].shipping_address as Record<string, unknown>).address).toBe("New Road");
+    expect((createBodies[1].shipping_address as Record<string, unknown>).address).toBe("Old Road");
+    expect(cachedOrderId).toBe("ORD-RESTORED");
+  });
+
+  it("does not create a compensating order when only local cache bookkeeping fails", async () => {
+    let createCount = 0;
+    let cacheWrites = 0;
+    const client = new NimbusClient(
+      { apiUrl: "https://nimbus.test", apiKey: "key", apiSecret: "secret", maxPages: 2, mockMode: false },
+      { getOrderId: async () => undefined, cacheOrder: async () => { cacheWrites++; if (cacheWrites > 1) throw new Error("cache unavailable"); } },
+    );
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v2/orders" && url.search) return json({ success: true, data: [{ order_id: "ORD-OLD", order_number: "#RBD5001", order_status: "created" }] });
+      if (url.pathname === "/v2/orders/ORD-OLD") return json({ success: true, data: { order_number: "#RBD5001", order_type: "forward", payment_mode: "prepaid", warehouse_id: "WH-1", shipping_address: { name: "Asha", address: "Old Road", pincode: 560001, city: "Bengaluru", state: "Karnataka", country: "India", phone: 9876543210 }, items: [{ name: "Rakhi", qty: 1 }], package: { weight: 0.5 } } });
+      if (url.pathname.endsWith("/cancel")) return json({ success: true, data: {} });
+      if (url.pathname === "/v2/orders" && init?.method === "POST") { createCount++; return json({ success: true, data: { order_id: "ORD-NEW", order_number: "#RBD5001", order_status: "created" } }); }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    await expect(client.replacePendingOrderAddress("#RBD5001", { address1: "New Road", city: "Kolkata", province: "West Bengal", zip: "700016", country: "India", phone: "9123456789" })).resolves.toBeUndefined();
+    expect(createCount).toBe(1);
+  });
+
+  it("does not create a second order after an ambiguous replacement timeout", async () => {
+    let createCount = 0;
+    const client = new NimbusClient(
+      { apiUrl: "https://nimbus.test", apiKey: "key", apiSecret: "secret", maxPages: 2, mockMode: false },
+      { getOrderId: async () => undefined, cacheOrder: async () => undefined },
+    );
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v2/orders" && url.search) return json({ success: true, data: [{ order_id: "ORD-OLD", order_number: "#RBD5001", order_status: "created" }] });
+      if (url.pathname === "/v2/orders/ORD-OLD") return json({ success: true, data: { order_number: "#RBD5001", order_type: "forward", payment_mode: "prepaid", warehouse_id: "WH-1", shipping_address: { name: "Asha", address: "Old Road", pincode: 560001, city: "Bengaluru", state: "Karnataka", country: "India", phone: 9876543210 }, items: [{ name: "Rakhi", qty: 1 }], package: { weight: 0.5 } } });
+      if (url.pathname.endsWith("/cancel")) return json({ success: true, data: {} });
+      if (url.pathname === "/v2/orders" && init?.method === "POST") { createCount++; throw new TypeError("socket closed after upload"); }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    await expect(client.replacePendingOrderAddress("#RBD5001", { address1: "New Road", city: "Kolkata", province: "West Bengal", zip: "700016", country: "India", phone: "9123456789" })).rejects.toThrow("did not confirm whether the replacement order was created");
+    expect(createCount).toBe(1);
+  });
 });

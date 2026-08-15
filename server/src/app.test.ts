@@ -3,13 +3,16 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "./app.js";
 import type { Store } from "./store.js";
-import type { Batch, ShippingJob, UserRecord } from "./types.js";
+import type { Batch, ShippingJob, SupportConversation, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
 
 class MemoryStore implements Store {
   private users: UserRecord[] = [];
   private history: Batch[] = [];
   private cache = new Map<string, string>();
   private jobs = new Map<string, ShippingJob>();
+  private messages: WhatsAppMessage[] = [];
+  private conversations = new Map<string, SupportConversation>();
+  private tickets = new Map<string, SupportTicket>();
   async init() { this.users = [{ id: 1, username: "admin", passwordHash: await bcrypt.hash("admin123", 4), role: "admin" }]; }
   async findUser(username: string) { return this.users.find((user) => user.username.toLowerCase() === username.toLowerCase()); }
   async createUser(username: string, passwordHash: string, role: UserRecord["role"]) {
@@ -25,6 +28,14 @@ class MemoryStore implements Store {
   async getShippingJob(jobId: string) { const job = this.jobs.get(jobId); return job ? structuredClone(job) : undefined; }
   async getActiveShippingJob(username: string) { const job = [...this.jobs.values()].find((item) => item.createdBy.toLowerCase() === username.toLowerCase() && ["queued", "processing"].includes(item.status)); return job ? structuredClone(job) : undefined; }
   async getPendingShippingJobs() { return [...this.jobs.values()].filter((job) => ["queued", "processing"].includes(job.status)).map((job) => structuredClone(job)); }
+  async withConversationLock<T>(_phone: string, task: () => Promise<T>) { return task(); }
+  async addWhatsAppMessage(message: Omit<WhatsAppMessage, "id" | "createdAt">) { if (message.providerMessageId && this.messages.some((item) => item.providerMessageId === message.providerMessageId)) return false; this.messages.unshift({ ...message, id: String(this.messages.length + 1), createdAt: new Date().toISOString() }); return true; }
+  async getConversation(phone: string) { const conversation = this.conversations.get(phone); return conversation ? structuredClone(conversation) : undefined; }
+  async saveConversation(conversation: Omit<SupportConversation, "updatedAt" | "expiresAt">) { const now = new Date(); this.conversations.set(conversation.phone, { ...structuredClone(conversation), updatedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 24 * 60 * 60_000).toISOString() }); }
+  async clearConversation(phone: string) { this.conversations.delete(phone); }
+  async createSupportTicket(ticket: SupportTicket) { this.tickets.set(ticket.ticketId, structuredClone(ticket)); }
+  async updateSupportTicket(ticketId: string, status: SupportTicketStatus) { const ticket = this.tickets.get(ticketId); if (!ticket) return false; ticket.status = status; ticket.resolvedAt = status === "resolved" ? new Date().toISOString() : undefined; return true; }
+  async getSupportOverview(): Promise<SupportOverview> { return { messages: structuredClone(this.messages), tickets: structuredClone([...this.tickets.values()]), conversations: structuredClone([...this.conversations.values()]), stats: { inboundToday: this.messages.filter((message) => message.direction === "inbound").length, outboundToday: this.messages.filter((message) => message.direction === "outbound").length, activeConversations: this.conversations.size, openTickets: [...this.tickets.values()].filter((ticket) => ticket.status === "open").length } }; }
 }
 
 const config = {
@@ -37,6 +48,9 @@ const config = {
   nimbusApiKey: "",
   nimbusApiSecret: "",
   maxLookupPages: 2,
+  whatsappProvider: "disabled" as const,
+  whatsappVerifyToken: "test-verify-token",
+  supportPhone: "919876543210",
 };
 const makeApp = () => createApp(config, new MemoryStore());
 async function login(app: Awaited<ReturnType<typeof makeApp>>) { const response = await request(app).post("/api/auth/login").send({ username: "admin", password: "admin123" }); return response.body.token as string; }
@@ -50,4 +64,32 @@ describe("AutoShip API", () => {
   it("ships a partial batch and stores its history", async () => { const app = await makeApp(); const token = await login(app); const shipped = await request(app).post("/api/ship-bulk").set("Authorization", `Bearer ${token}`).send({ orderNumbers: ["RBD4023", "RBD4030", "RBD4035", "RBD4044"] }); expect(shipped.status).toBe(200); expect(shipped.body.totalShipped).toBe(2); expect(shipped.body.totalFailed).toBe(2); expect(shipped.body.shipped[1].alreadyBooked).toBe(true); expect(shipped.body.labelUrl).toContain("/demo-labels"); const history = await request(app).get("/api/history").set("Authorization", `Bearer ${token}`); expect(history.body.batches).toHaveLength(1); expect(history.body.batches[0].batchId).toBe(shipped.body.batchId); });
   it("runs a persistent job with progress logs and prevents a second active job", async () => { const app = await makeApp(); const token = await login(app); const started = await request(app).post("/api/shipping-jobs").set("Authorization", `Bearer ${token}`).send({ orderNumbers: ["RBD4023", "#RBD4030", "RBD4035", "#RBD4044"] }); expect(started.status).toBe(202); expect(started.body.job.orderNumbers[0]).toBe("#RBD4023"); const duplicate = await request(app).post("/api/shipping-jobs").set("Authorization", `Bearer ${token}`).send({ orderNumbers: ["RBD4050"] }); expect(duplicate.status).toBe(409); const job = await waitForJob(app, token, started.body.job.jobId); expect(job.status).toBe("completed"); expect(job.processed).toBe(4); expect(job.shipped).toHaveLength(2); expect(job.failed).toHaveLength(2); expect(job.logs.some((log) => log.level === "success")).toBe(true); expect(job.logs.some((log) => log.level === "error" && log.orderNumber === "#RBD4030")).toBe(true); expect(job.result?.totalFailed).toBe(2); });
   it("requires authentication for shipping", async () => { const app = await makeApp(); const response = await request(app).post("/api/ship-bulk").send({ orderNumbers: ["RBD4023"] }); expect(response.status).toBe(401); });
+  it("verifies the WhatsApp webhook and persists one deduplicated conversation", async () => {
+    const app = await makeApp();
+    const challenge = await request(app).get("/api/whatsapp/webhook").query({ "hub.mode": "subscribe", "hub.verify_token": "test-verify-token", "hub.challenge": "challenge-123" });
+    expect(challenge.status).toBe(200); expect(challenge.text).toBe("challenge-123");
+    const payload = { id: "message-1", from: "919876543210", text: "hello ji" };
+    expect((await request(app).post("/api/whatsapp/webhook").send(payload)).status).toBe(200);
+    expect((await request(app).post("/api/whatsapp/webhook").send(payload)).status).toBe(200);
+    const token = await login(app);
+    let overview: SupportOverview | undefined;
+    for (let attempt = 0; attempt < 20; attempt++) { overview = (await request(app).get("/api/support/overview").set("Authorization", `Bearer ${token}`)).body; if (overview?.stats.outboundToday) break; await new Promise((resolve) => setTimeout(resolve, 10)); }
+    expect(overview?.stats.inboundToday).toBe(1); expect(overview?.stats.outboundToday).toBe(1); expect(overview?.conversations[0].step).toBe("waiting_menu");
+  });
+  it("asks for a refund/return/missing subtype before collecting an order", async () => {
+    const app = await makeApp(); const token = await login(app);
+    expect((await request(app).post("/api/whatsapp/webhook").send({ id: "message-refund-menu", from: "919876543210", text: "6" })).status).toBe(200);
+    const overview = await request(app).get("/api/support/overview").set("Authorization", `Bearer ${token}`);
+    expect(overview.body.conversations).toEqual([expect.objectContaining({ phone: "919876543210", intent: "refund_return", step: "waiting_issue" })]);
+  });
+  it("restricts the support dashboard and ticket updates to admins", async () => {
+    const app = await makeApp();
+    const registration = await request(app).post("/api/auth/register").send({ username: "support-packer", password: "a secure passphrase" });
+    expect((await request(app).get("/api/support/overview").set("Authorization", `Bearer ${registration.body.token}`)).status).toBe(403);
+    const token = await login(app);
+    const missing = await request(app).patch("/api/support/tickets/00000000-0000-0000-0000-000000000000").set("Authorization", `Bearer ${token}`).send({ status: "resolved" });
+    expect(missing.status).toBe(404);
+    const invalid = await request(app).patch("/api/support/tickets/invalid").set("Authorization", `Bearer ${token}`).send({ status: "closed" });
+    expect(invalid.status).toBe(400);
+  });
 });

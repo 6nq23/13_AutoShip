@@ -1,4 +1,4 @@
-import type { FailedOrder, NimbusProgressEvent, OrderMatch, ShippedOrder } from "./types.js";
+import type { FailedOrder, NimbusNdr, NimbusProgressEvent, NimbusTracking, OrderMatch, ShippedOrder, ShopifyAddress } from "./types.js";
 
 type NimbusConfig = { apiUrl: string; apiKey: string; apiSecret: string; maxPages: number; mockMode: boolean };
 type Envelope<T> = { success: true; data: T; meta?: { pagination?: { totalPages?: number } } };
@@ -38,6 +38,77 @@ export class NimbusClient {
     return { shipped, failed, labelUrl };
   }
 
+  async lookupOrder(orderNumber: string, signal = AbortSignal.timeout(20_000)) { return this.resolveOrder(this.normalizeOrderNumber(orderNumber), signal); }
+
+  async track(awb: string) {
+    if (this.config.mockMode) return { orderStatus: "booked", shipment: { awb, courierName: "Delhivery Surface", edd: new Date(Date.now() + 3 * 86_400_000).toISOString() }, latest: { shipStatus: "in transit", eventTime: new Date().toISOString(), location: "Bengaluru Hub", message: "In transit" } } satisfies NimbusTracking;
+    return (await this.request<Envelope<NimbusTracking>>(`/v2/tracking/${encodeURIComponent(awb)}`)).data;
+  }
+
+  async getNdr(awb: string) {
+    if (this.config.mockMode) return { awb, attempt_count: 1, last_attempt_date: new Date().toISOString(), remarks: "Customer not available", available_actions: ["reattempt", "rto"] } satisfies NimbusNdr;
+    for (let page = 1; page <= this.config.maxPages; page++) {
+      const response = await this.request<Envelope<NimbusNdr[]>>(`/v2/ndr?limit=100&page=${page}`);
+      const match = response.data.find((item) => item.awb === awb);
+      if (match) return match;
+      const totalPages = response.meta?.pagination?.totalPages;
+      if ((totalPages !== undefined && page >= totalPages) || response.data.length < 100) break;
+    }
+    return null;
+  }
+
+  async submitNdrAction(awb: string, input: { action: "reattempt" | "rto"; updated_address?: { address: string; city: string; state: string; pincode: string }; updated_phone?: string }) {
+    if (this.config.mockMode) return;
+    await this.request(`/v2/ndr/${encodeURIComponent(awb)}/action`, { method: "POST", body: JSON.stringify(input) });
+  }
+
+  async replacePendingOrderAddress(orderNumber: string, address: ShopifyAddress) {
+    if (this.config.mockMode) return;
+    const order = await this.lookupOrder(orderNumber);
+    const details = await this.getOrderDetails(order.order_id);
+    const originalBody = {
+      order_number: details.order_number,
+      order_type: details.order_type,
+      payment_mode: details.payment_mode,
+      ...(details.order_collectable_amount !== undefined ? { order_collectable_amount: details.order_collectable_amount } : {}),
+      warehouse_id: details.warehouse_id,
+      shipping_address: details.shipping_address as Record<string, unknown>,
+      items: details.items,
+      package: details.package,
+      ...(details.channel_id ? { channel_id: details.channel_id } : {}),
+    };
+    const body = {
+      ...originalBody,
+      shipping_address: {
+        ...originalBody.shipping_address,
+        name: address.name || `${address.firstName || ""} ${address.lastName || ""}`.trim(),
+        address: address.address1,
+        address_opt: address.address2 || "",
+        pincode: Number(address.zip),
+        city: address.city,
+        state: address.province || address.provinceCode || "",
+        country: address.country || "India",
+        phone: Number((address.phone || "").replace(/\D/g, "").slice(-10)),
+      },
+    };
+    if (!body.order_number || !body.order_type || !body.payment_mode || !body.warehouse_id || !Array.isArray(body.items) || !body.items.length || !body.package || !/^\d{6}$/.test(String(body.shipping_address.pincode)) || !/^\d{10}$/.test(String(body.shipping_address.phone))) throw new AppError("RECREATE_DATA_MISSING", "NimbusPost did not return enough order data to recreate this shipment safely");
+    await this.request(`/v2/orders/${encodeURIComponent(order.order_id)}/cancel`, { method: "POST", body: JSON.stringify({ reason: "Customer requested address update before dispatch" }) });
+    let replacement: Envelope<OrderMatch>;
+    try {
+      replacement = await this.request<Envelope<OrderMatch>>("/v2/orders", { method: "POST", body: JSON.stringify(body) });
+    } catch (replacementError) {
+      if (!this.isDefinitiveCreateRejection(replacementError)) throw new AppError("REPLACEMENT_STATUS_UNKNOWN", `NimbusPost did not confirm whether the replacement order was created. AutoShip did not create another order; manual reconciliation is required. ${this.describeError(replacementError).error}`);
+      try {
+        const restored = await this.request<Envelope<OrderMatch>>("/v2/orders", { method: "POST", body: JSON.stringify(originalBody) });
+        await this.cache.cacheOrder(this.normalizeOrderNumber(orderNumber), restored.data.order_id).catch((error) => console.error("NimbusPost restored-order cache update failed", error));
+      } catch (restoreError) {
+        throw new AppError("REPLACEMENT_AND_RESTORE_FAILED", `NimbusPost cancelled the original order, then both replacement and automatic restoration failed: ${this.describeError(replacementError).error}; restore: ${this.describeError(restoreError).error}`);
+      }
+      throw new AppError("REPLACEMENT_FAILED_RESTORED", `NimbusPost rejected the new address, so AutoShip restored the original order: ${this.describeError(replacementError).error}`);
+    }
+    await this.cache.cacheOrder(this.normalizeOrderNumber(orderNumber), replacement.data.order_id).catch((error) => console.error("NimbusPost replacement cache update failed", error));
+  }
+
   private async shipOne(orderNumber: string, signal: AbortSignal, onProgress?: (event: NimbusProgressEvent) => Promise<void>): Promise<ShippedOrder> {
     if (this.config.mockMode) return this.mockShip(orderNumber, onProgress);
     const order = await this.resolveOrder(orderNumber, signal);
@@ -75,8 +146,11 @@ export class NimbusClient {
     await this.cache.cacheOrder(orderNumber, match.order_id); return match;
   }
 
+  private normalizeOrderNumber(value: string) { return `#${value.trim().replace(/^#/, "").toUpperCase()}`; }
+
   private listOrders(query: Record<string, string>, signal: AbortSignal) { return this.request<Envelope<OrderMatch[]>>(`/v2/orders?${new URLSearchParams(query)}`, {}, 0, signal); }
   private async getOrder(orderId: string, signal: AbortSignal) { return (await this.request<Envelope<OrderMatch>>(`/v2/orders/${encodeURIComponent(orderId)}`, {}, 0, signal)).data; }
+  private async getOrderDetails(orderId: string) { return (await this.request<Envelope<Record<string, unknown>>>(`/v2/orders/${encodeURIComponent(orderId)}`)).data; }
   private async labels(ids: string[]) {
     if (this.config.mockMode) return `/demo-labels?ids=${encodeURIComponent(ids.join(","))}`;
     try {
@@ -108,6 +182,7 @@ export class NimbusClient {
     throw new AppError("COURIER_PRIORITY_EXHAUSTED", `All ${COURIER_PRIORITY.length} priority couriers rejected this shipment.`);
   }
   private describeError(error: unknown) { if (error instanceof AppError) return { code: error.code, error: error.message }; return { code: "NETWORK_ERROR", error: "NimbusPost could not be reached. Try this order again." }; }
+  private isDefinitiveCreateRejection(error: unknown) { return error instanceof AppError && ["VALIDATION_FAILED", "BAD_REQUEST", "INVALID_REQUEST", "DUPLICATE_ORDER", "DUPLICATE_ORDER_NUMBER", "HTTP_400", "HTTP_409", "HTTP_422"].includes(error.code); }
 }
 
 class AppError extends Error { constructor(public readonly code: string, message: string) { super(message); } }

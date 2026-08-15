@@ -1,463 +1,744 @@
-# AutoShip — Final Implementation Plan
+# AutoShip WhatsApp Customer Support Automation
 
-## Confirmed Decisions
+## Problem
 
-| Decision | Answer |
-|----------|--------|
-| **Order ID in QR** | `#RBDXXXX` (Shopify order number, which is `order_number` in NimbusPost) |
-| **Tech Stack** | TypeScript + React (Vite) + Node.js (Express) |
-| **Architecture** | PWA on phone (scanning) + same web app on desktop (labels/mgmt) + Express backend |
-| **Courier Selection** | Auto-allocate — NimbusPost uses your preset courier priority rules (Delhivery Surface → Bluedart → Xpressbees → etc.) |
-| **Users** | 2-3 people, need basic login/auth |
-| **Label Printing** | Both phone and desktop — merged PDF download |
-| **QR Content** | Just the order number, nothing else (e.g., `RBD4023`) |
+~1,000 WhatsApp customer inquiries per day across 6 categories, all handled manually. Customers write in many different ways (Hindi, English, Hinglish, typos, abbreviations) and often don't have their order number handy.
+
+---
+
+## Core Design: Menu-First, Then Collect Details
+
+Instead of trying to be clever about guessing what the customer wants from a messy first message, the bot follows a **simple, reliable 3-step flow**:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  STEP 1: Understand the intent                                   │
+│                                                                   │
+│  Try keyword detection on the first message.                     │
+│  ✅ Keywords matched → jump to Step 2                            │
+│  ❌ Not understood  → show numbered menu:                        │
+│                                                                   │
+│    "Namaste! 🙏 How can we help you?                             │
+│     Reply with the number:                                       │
+│     1️⃣ Confirm my order                                         │
+│     2️⃣ Change address or phone number                           │
+│     3️⃣ Check order status / tracking                            │
+│     4️⃣ Why is my order not dispatched?                          │
+│     5️⃣ My delivery failed                                      │
+│     6️⃣ Refund / Return / Missing item"                         │
+│                                                                   │
+│  Customer replies "3" → intent = order_status                    │
+├──────────────────────────────────────────────────────────────────┤
+│  STEP 2: Collect the order number                                │
+│                                                                   │
+│  If order number was in the first message → use it               │
+│  Otherwise → ask:                                                │
+│    "Please share your order number (e.g. RBD5001).               │
+│     If you don't have it, just send your phone number."          │
+│                                                                   │
+│  Customer sends "9876543210"                                     │
+│  → Look up in Shopify by phone → find latest order(s)            │
+│  → If multiple orders, ask which one                             │
+├──────────────────────────────────────────────────────────────────┤
+│  STEP 3: Handle the request + reply                              │
+│                                                                   │
+│  Now we have: intent + order number                              │
+│  → Run the handler → send the answer                             │
+│  → For refund/return: forward to human phone number              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Why this works for your case
+- **Customers who write clearly** ("Where is RBD5001?") → keyword match + order number extracted → instant answer, no menu needed
+- **Customers who write messy** ("hello ji kuch puchna tha") → menu shown → they pick a number → clean intent
+- **Customers without order number** → phone number fallback via Shopify lookup
+- **Refund/return/missing** → collected info + forwarded to human phone number, not stuck in a bot loop
+
+---
+
+## The 6 Inquiry Categories & What We Can Automate
+
+| # | Inquiry | Automation | How |
+|---|---------|-----------|-----|
+| 1 | **Confirm my order** | ✅ Fully auto | Shopify lookup → items, amount, status, ETA |
+| 2 | **Change address/phone** | ⚠️ Depends on timing | Before dispatch: Shopify update. After dispatch (NDR): NimbusPost NDR action. In-transit: escalate |
+| 3 | **Order status/tracking** | ✅ Fully auto | NimbusPost `GET /v2/tracking/{awb}` → status + location + ETA |
+| 4 | **Not dispatched yet** | ✅ Fully auto | Check NimbusPost order status → give honest reason |
+| 5 | **Delivery failed** | ✅ Mostly auto | NimbusPost NDR → show reason → offer re-attempt / address update / RTO |
+| 6 | **Refund/return/missing** | 🔴 Human | Collect order# → forward customer to support phone number |
+
+---
+
+## Complete Conversation Flowcharts
+
+### Master Flow (every message goes through this)
+
+```
+Customer sends ANY message
+        │
+        ▼
+┌─ Has active conversation? ──────────────────────────┐
+│  YES → resume where we left off (Step 2/3)          │
+│  NO  → start fresh:                                 │
+│        ├─ Try keyword detection on message           │
+│        │   ├─ Intent found? → set intent             │
+│        │   │   ├─ Order# also found? → go to Step 3  │
+│        │   │   └─ No order# → go to Step 2           │
+│        │   └─ Intent NOT found? → show menu (Step 1) │
+│        └─ Is it a menu number (1-6)? → set intent    │
+└─────────────────────────────────────────────────────┘
+```
+
+### Category 1: Confirm My Order
+
+```
+Bot: "Please share your order number (e.g. RBD5001),
+      or send your phone number."
+Customer: "RBD5001"
+        │
+        ▼
+  Shopify: GET order by name "RBD5001"
+  NimbusPost: resolve order → check status
+        │
+        ▼
+Bot: "✅ Order #RBD5001 is confirmed!
+      📦 Items: Rakhi Set x2, Lumba Rakhi x1
+      💰 Total: ₹499 (Prepaid ✅)
+      📍 Shipping to: Asha Rao, 12 MG Road, Bengaluru 560001
+      🚚 Courier: Delhivery Surface
+      📅 Expected delivery: 18 Aug 2026
+
+      Need anything else? Reply with a number:
+      1️⃣ Track this order
+      2️⃣ Change address
+      3️⃣ Something else"
+```
+
+### Category 2: Change Address/Phone
+
+```
+Bot: "Please share your order number or phone number."
+Customer: "RBD5001"
+        │
+        ▼
+  Check order status in NimbusPost
+        │
+        ├─ NOT yet shipped (created/booked)
+        │   Bot: "Send your new complete address"
+        │   Customer: "14 Park Street, Flat 2A, Kolkata 700016"
+        │   Bot: "Send the new phone number (or 'same' to keep current)"
+        │   Customer: "same"
+        │   Bot: "Please confirm:
+        │         📍 New address: 14 Park Street, Flat 2A, Kolkata 700016
+        │         📱 Phone: same as before
+        │         Reply YES to update or NO to cancel"
+        │   Customer: "YES"
+        │   → Cancel old NimbusPost order → create new with updated Shopify address
+        │   Bot: "✅ Address updated! Your order will be shipped to the new address."
+        │
+        ├─ Shipped but delivery FAILED (NDR)
+        │   → POST /v2/ndr/{awb}/action with updated_address + updated_phone
+        │   Bot: "✅ Address updated! Re-delivery will be attempted."
+        │
+        ├─ Shipped and IN TRANSIT (no NDR)
+        │   Bot: "Your order is already in transit with {courier}.
+        │         Unfortunately we cannot change the address at this stage.
+        │         Please contact our support: {SUPPORT_PHONE}"
+        │
+        └─ Already DELIVERED
+            Bot: "This order was already delivered on {date}."
+```
+
+### Category 3: Order Status / Tracking
+
+```
+Bot: "Please share your order number or phone number."
+Customer: "9876543210"
+        │
+        ▼
+  Shopify: find orders by phone 9876543210
+  Found 3 orders → show list:
+        │
+Bot: "We found these orders for your number:
+      1️⃣ #RBD5001 — Rakhi Set (₹499)
+      2️⃣ #RBD4998 — Lumba Rakhi (₹299)
+      3️⃣ #RBD4950 — Gift Hamper (₹999)
+      Reply with the number."
+Customer: "1"
+        │
+        ▼
+  NimbusPost: GET /v2/tracking/{awb}
+        │
+        ▼
+  Reply based on latest.shipStatus:
+  ├─ "booked"           → "📦 Order booked! Waiting for courier pickup."
+  ├─ "picked up"        → "📦 Picked up by {courier} on {date}."
+  ├─ "in transit"       → "🚚 In transit! Currently at {location}. ETA: {edd}"
+  ├─ "out for delivery"  → "🎉 Out for delivery today!"
+  ├─ "delivered"        → "✅ Delivered on {date}."
+  ├─ "rto"/"returning"  → "↩️ Being returned. Reason: {reason}"
+  └─ "ndr"              → "⚠️ Delivery attempt failed: {reason}. Reply 'reattempt' to retry."
+
+  + tracking link: "Track live: {tracking_url}"
+```
+
+### Category 4: Not Dispatched Yet
+
+```
+Bot: "Please share your order number or phone number."
+Customer: "RBD5001"
+        │
+        ▼
+  Check Shopify fulfillment status + NimbusPost order status
+        │
+        ├─ Not found in NimbusPost at all
+        │   Bot: "Your order is being processed by our team. 
+        │         It will be shipped within 24-48 hours. 📦
+        │         We'll send you tracking details once dispatched!"
+        │
+        ├─ Status "created" (in NimbusPost but not booked)
+        │   Bot: "Your order is ready and queued for shipping!
+        │         The courier will pick it up today or tomorrow. 🚛"
+        │
+        ├─ Status "booked" (booked, awaiting pickup)
+        │   Bot: "Your order is booked with {courier}! 
+        │         Courier pickup is scheduled. You'll receive
+        │         tracking details shortly. 📋"
+        │
+        └─ Already shipped/in-transit
+            → redirect to order_status handler (Category 3)
+```
+
+### Category 5: Delivery Failed
+
+```
+Bot: "Please share your order number or phone number."
+Customer: "RBD5001"
+        │
+        ▼
+  NimbusPost: GET /v2/tracking/{awb} → check status
+  NimbusPost: GET /v2/ndr → find by AWB
+        │
+        ├─ NDR found
+        │   Bot: "⚠️ Delivery was attempted on {date}.
+        │         Reason: {remarks} (e.g. 'Customer not available')
+        │         Attempt #{attempt_count}
+        │
+        │         What would you like to do?
+        │         1️⃣ Re-attempt delivery
+        │         2️⃣ Update my address/phone for re-delivery
+        │         3️⃣ Return to sender"
+        │
+        │   Customer: "1"
+        │   → POST /v2/ndr/{awb}/action { action: "reattempt" }
+        │   Bot: "✅ Re-delivery has been scheduled! 
+        │         The courier will attempt again soon."
+        │
+        │   Customer: "2"
+        │   → enter change_address flow (Category 2, NDR branch)
+        │
+        │   Customer: "3"
+        │   → POST /v2/ndr/{awb}/action { action: "rto" }
+        │   Bot: "↩️ Return initiated. Once we receive the package,
+        │         your refund will be processed.
+        │         Contact {SUPPORT_PHONE} for refund queries."
+        │
+        └─ No NDR (order shows failed/rto in tracking but not in NDR list)
+            Bot: "Your order status shows it could not be delivered.
+                  Reason: {tracking reason}
+                  Please contact our support team: {SUPPORT_PHONE}"
+```
+
+### Category 6: Refund / Return / Missing Item
+
+```
+Bot: "We're sorry to hear that! 😔
+      Please share your order number or phone number 
+      so we can look it up."
+Customer: "RBD5001"
+        │
+        ▼
+  Shopify: look up order → get details
+        │
+Bot: "We found your order #RBD5001 (Rakhi Set x2, ₹499).
+
+      For refund, return, and missing item requests,
+      please message our support team directly:
+      📞 {SUPPORT_PHONE_NUMBER}
+
+      When you message them, please mention:
+      • Order: #RBD5001
+      • Issue: [refund/return/missing]
+
+      Our team will help you right away! 🙏"
+
+  → Log this in support_tickets table (phone, order#, category)
+  → Optionally: send a WhatsApp msg TO the support number:
+    "⚠️ Customer {phone} needs help with order #RBD5001 
+     (refund/return/missing). They will message you."
+```
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    PHONE (PWA - Chrome)                      │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  React App (Vite + TypeScript)                         │  │
-│  │  • QR Scanner (camera API via html5-qrcode)           │  │
-│  │  • Scanned order list (local state)                   │  │
-│  │  • "Bulk Ship" → POST /api/ship-bulk                  │  │
-│  │  • Results + Label PDF download                       │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                                                              │
-│                    DESKTOP (Browser)                         │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  Same React App                                        │  │
-│  │  • Dashboard / history view                           │  │
-│  │  • Manual order entry (type order numbers)            │  │
-│  │  • Label download + print                             │  │
-│  │  • Settings / user management                         │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────┬───────────────────────────┘
-                                   │ HTTPS
-                                   ▼
-┌──────────────────────────────────────────────────────────────┐
-│              EXPRESS BACKEND (Node.js + TypeScript)          │
-│                                                              │
-│  /api/auth/login          → JWT-based simple auth           │
-│  /api/orders/lookup       → Resolve order_number → order_id │
-│  /api/ship-bulk           → Book N orders + return results  │
-│  /api/labels              → Fetch merged label PDF          │
-│  /api/history             → Past shipping batches           │
-│                                                              │
-│  ┌──────────────────┐  ┌──────────────────────────────────┐ │
-│  │ NimbusPost API   │  │ SQLite / JSON file               │ │
-│  │ Client (axios)   │  │ • Users (2-3 accounts)           │ │
-│  │ • API key pair   │  │ • Shipping history               │ │
-│  │   stored in .env │  │ • order_number → order_id cache  │ │
-│  └──────────────────┘  └──────────────────────────────────┘ │
-└──────────────────────────────────┬───────────────────────────┘
-                                   │ HTTPS
-                                   ▼
-┌──────────────────────────────────────────────────────────────┐
-│              NimbusPost API v2                               │
-│              https://api-v2.nimbuspost.com                   │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                   CUSTOMER (WhatsApp)                    │
+│  "mera order kab aayega"                                │
+└─────────────────────┬───────────────────────────────────┘
+                      │ WhatsApp webhook
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│              AUTOSHIP SERVER (Express)                    │
+│                                                          │
+│  POST /api/whatsapp/webhook                              │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │        Message Pipeline                            │  │
+│  │                                                    │  │
+│  │  1. Check for active conversation (resume)         │  │
+│  │  2. Try keyword classification                     │  │
+│  │  3. If unclear → show menu                         │  │
+│  │  4. Once intent known → collect order number       │  │
+│  │     (from msg, or ask → accept RBD# or phone)     │  │
+│  │  5. Route to handler                               │  │
+│  └──────────┬───────────────────────────────────────┘  │
+│             │                                           │
+│  ┌──────────▼───────────────────────────────────────┐  │
+│  │  Handlers                                         │  │
+│  │  confirm_order   → Shopify + NimbusPost lookup    │  │
+│  │  change_address  → multi-step + NimbusPost/Shopify│  │
+│  │  order_status    → NimbusPost tracking            │  │
+│  │  not_dispatched  → NimbusPost order check         │  │
+│  │  order_failed    → NimbusPost NDR + actions       │  │
+│  │  refund_return   → collect order# → forward to    │  │
+│  │                    SUPPORT_PHONE_NUMBER            │  │
+│  └──────────────────────────────────────────────────┘  │
+│                                                          │
+│  Existing:  NimbusClient  |  PostgresStore               │
+└──────────┬──────────┬──────────────────────────────────┘
+           │          │
+     ┌─────▼──┐  ┌───▼─────────────┐
+     │Shopify │  │ NimbusPost v2   │
+     │  API   │  │ (existing)      │
+     └────────┘  └─────────────────┘
 ```
 
 ---
 
-## The Core Flow — What Happens Under the Hood
-
-### Step 1: Scan (Phone Only)
-
-```
-User scans QR → phone camera reads "RBD4023"
-                → App strips "#" if present
-                → Checks duplicate against local list
-                → Adds to scanned list (in React state)
-                → Plays success beep
-                → Counter: "23 orders scanned"
-```
-
-**No API calls during scanning.** Pure local. Fast.
-
-### Step 2: Bulk Ship (The Big Button)
-
-When user clicks "SHIP ALL", one `POST /api/ship-bulk` call to our backend with:
-```json
-{
-  "orderNumbers": ["RBD4023", "RBD4024", "RBD4025", ...]
-}
-```
-
-The backend then does this for each order:
-
-```mermaid
-flowchart TD
-    A["Receive bulk request:<br/>['RBD4023', 'RBD4024', ...]"] --> B["For each order_number"]
-    B --> C{"In local cache?"}
-    C -->|Yes| D["Use cached order_id"]
-    C -->|No| E["GET /v2/orders?order_number=RBDXXXX<br/>(or paginate through orders)"]
-    E --> F{"Found?"}
-    F -->|No| G["❌ Mark as 'NOT_FOUND' error"]
-    F -->|Yes| H["Cache order_number → order_id"]
-    H --> D
-    D --> I["POST /v2/shipments/book<br/>{order_id} — no courier_id<br/>(auto-allocate via your priority rules)"]
-    I --> J{"Booked?"}
-    J -->|Yes| K["✅ Collect AWB + booking details"]
-    J -->|No| L["❌ Collect error reason"]
-    K --> M["After all orders processed"]
-    L --> M
-    M --> N["POST /v2/shipments/labels<br/>{ids: [all successful order_ids]}"]
-    N --> O["Return to frontend:<br/>✅ successes + ❌ failures + 📄 label URL"]
-```
-
-### Step 3: Results + Labels
-
-```
-Frontend receives:
-{
-  "shipped": [
-    { "orderNumber": "RBD4023", "awb": "AWB123...", "courier": "Delhivery Surface DT", "cost": 75 },
-    ...
-  ],
-  "failed": [
-    { "orderNumber": "RBD4030", "error": "Order not found in NimbusPost" },
-    { "orderNumber": "RBD4035", "error": "No serviceable courier available" },
-    ...
-  ],
-  "labelUrl": "https://labels.nimbuspost.com/bulk/abc.pdf",
-  "totalShipped": 47,
-  "totalFailed": 3
-}
-```
-
-User sees:
-- ✅ **47 shipped** — with AWB numbers and courier names
-- ❌ **3 failed** — with specific error reasons per order
-- 📄 **"Download All Labels"** button → opens/downloads the merged PDF
-- 🖨️ Can print directly (works on both phone and desktop)
-
----
-
-## Order Number → Order ID Resolution
+## User Review Required
 
 > [!IMPORTANT]
-> This is the trickiest part. NimbusPost's `POST /v2/shipments/book` needs their internal `order_id`, but your QR code has the Shopify `order_number`.
+> ### WhatsApp API Provider
+> Which WhatsApp Business API provider do you use?
+> - **WhatsApp Cloud API (Meta)** — direct from Meta
+> - **Third-party** like Gupshup, Wati, Twilio, Interakt, AiSensy, etc.
 
-### Strategy: List + Filter + Cache
+> [!IMPORTANT]
+> ### Shopify API Access
+> Do you have a Shopify Admin API access token? We need:
+> - `Admin API access token` (starts with `shpat_`)
+> - Your Shopify store URL (e.g., `your-store.myshopify.com`)
 
-The NimbusPost `GET /v2/orders` API description says:
-> *"Filters pass through to the order-service list contract via query string."*
+> [!IMPORTANT]
+> ### Support Phone Number
+> What is the phone number you want refund/return/missing queries forwarded to? This will be the number the bot tells customers to contact directly.
 
-This means **undocumented query filters likely work** — including `order_number`. We will:
-
-1. **First attempt:** `GET /v2/orders?order_number=RBD4023` — if NimbusPost supports this filter, it returns the exact order with its `order_id`. Fast, one call per order.
-
-2. **Fallback if filter doesn't work:** Pull orders in batches (`GET /v2/orders?status=created&limit=100&page=1,2,3...`), find matches by `order_number` client-side, and cache the mapping.
-
-3. **Cache layer:** After first resolution, store `RBD4023 → ORD-123` in SQLite/JSON so we never look it up twice.
-
-> [!NOTE]
-> When we start building, the first thing we'll do is test which query filters NimbusPost actually accepts. This determines the speed of the lookup step.
+> [!WARNING]
+> ### NimbusPost Cannot Edit Orders
+> NimbusPost v2 has NO endpoint to edit an existing order. For address changes:
+> - **Before shipping**: Cancel old order in NimbusPost → create new one with updated address
+> - **After shipping (NDR only)**: Use `POST /v2/ndr/{awb}/action` with `updated_address`/`updated_phone`
+> - **In-transit (not NDR)**: Cannot change → escalate to human
 
 ---
 
-## Project Structure
+## Open Questions
+
+> [!IMPORTANT]
+> ### 1. WhatsApp approved templates
+> Do you already have any approved WhatsApp message templates? Templates are required for sending the first message to a customer (proactive outreach). For **replies** within 24h of customer's message, we can send free-form text — which covers most of our use case.
+
+> [!IMPORTANT]
+> ### 2. Multiple orders per phone number
+> When a customer sends their phone number and has multiple orders, should we:
+> - A) Show a list and ask them to pick? (recommended)
+> - B) Always use the most recent order?
+> - C) Show status of all orders at once?
+
+---
+
+## Conversation State Machine
+
+Every phone number has a conversation state tracked in PostgreSQL. States expire after 30 minutes of inactivity.
 
 ```
-d:\13_AutoShip\
-├── package.json                    # Root workspace
-├── .env                            # NIMBUS_API_KEY, NIMBUS_API_SECRET, JWT_SECRET
-│
-├── server/                         # Express backend
-│   ├── package.json
-│   ├── tsconfig.json
-│   ├── src/
-│   │   ├── index.ts                # Express app entry
-│   │   ├── config.ts               # Env vars + constants
-│   │   ├── middleware/
-│   │   │   └── auth.ts             # JWT auth middleware
-│   │   ├── routes/
-│   │   │   ├── auth.routes.ts      # POST /api/auth/login
-│   │   │   ├── orders.routes.ts    # GET /api/orders/lookup/:orderNumber
-│   │   │   ├── shipping.routes.ts  # POST /api/ship-bulk, POST /api/labels
-│   │   │   └── history.routes.ts   # GET /api/history
-│   │   ├── services/
-│   │   │   ├── nimbus.service.ts   # NimbusPost API client (axios)
-│   │   │   ├── shipping.service.ts # Bulk ship orchestration logic
-│   │   │   └── cache.service.ts    # order_number → order_id cache
-│   │   └── types/
-│   │       └── index.ts            # Shared TypeScript types
-│   └── data/
-│       ├── users.json              # Simple user store (2-3 users)
-│       └── history.json            # Shipping batch history
-│
-├── client/                         # React frontend (Vite)
-│   ├── package.json
-│   ├── tsconfig.json
-│   ├── vite.config.ts
-│   ├── index.html
-│   ├── public/
-│   │   ├── manifest.json           # PWA manifest
-│   │   ├── sw.js                   # Service worker (offline scanning)
-│   │   └── icons/                  # PWA icons
-│   └── src/
-│       ├── main.tsx                # React entry
-│       ├── App.tsx                 # Router + layout
-│       ├── index.css               # Global styles + design system
-│       ├── api/
-│       │   └── client.ts           # Axios client to our backend
-│       ├── hooks/
-│       │   ├── useScanner.ts       # QR scanning hook
-│       │   └── useAuth.ts          # Auth context/hook
-│       ├── pages/
-│       │   ├── LoginPage.tsx       # Simple login
-│       │   ├── ScanPage.tsx        # QR scanner + scanned list
-│       │   ├── ShipPage.tsx        # Review + "Ship All" + results
-│       │   ├── HistoryPage.tsx     # Past batches
-│       │   └── SettingsPage.tsx    # Account settings
-│       ├── components/
-│       │   ├── Scanner.tsx         # Camera QR reader component
-│       │   ├── OrderList.tsx       # Scanned orders list
-│       │   ├── ShipResults.tsx     # Success/error results
-│       │   ├── Navbar.tsx          # Top nav (responsive)
-│       │   └── ProtectedRoute.tsx  # Auth guard
-│       └── utils/
-│           ├── sounds.ts           # Beep/buzzer audio
-│           └── validators.ts       # Order number validation
-│
-└── shared/                         # Shared types between client & server
-    └── types.ts
+┌─────────────────────────────────────────────────────────┐
+│                    STATES                                 │
+│                                                          │
+│  (none)           → fresh, no active conversation        │
+│  waiting_menu     → menu shown, waiting for 1-6          │
+│  waiting_order    → intent known, waiting for order#     │
+│  waiting_pick     → multiple orders found, pick one      │
+│  handling         → inside a handler's multi-step flow   │
+│    └─ substates per handler:                             │
+│       change_address: waiting_address → waiting_phone    │
+│                       → waiting_confirm                  │
+│       order_failed:   waiting_ndr_choice                 │
+│  done             → answered, conversation cleared       │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Order Identification Flow (shared by all handlers)
+
+```
+Customer has no order number
+        │
+Bot: "Please share your order number (e.g. RBD5001).
+      Don't have it? Send your phone number instead."
+        │
+        ├─ Customer sends "RBD5001"
+        │   → regex match → resolve in Shopify/NimbusPost → proceed
+        │
+        ├─ Customer sends "9876543210" (10 digits)
+        │   → Shopify: GET orders by phone
+        │   ├─ 0 orders → "We couldn't find any orders for this number. 
+        │   │              Please check and try again."
+        │   ├─ 1 order  → use it, proceed
+        │   └─ 2+ orders → show numbered list, ask to pick
+        │
+        └─ Customer sends something else
+            → "Sorry, I didn't understand. Please send your order 
+               number (like RBD5001) or your 10-digit phone number."
+            → retry (max 3 times, then show menu again)
 ```
 
 ---
 
-## NimbusPost API Endpoints Used
+## Proposed Changes
 
-| Our Endpoint | NimbusPost API | When |
-|-------------|---------------|------|
-| `POST /api/ship-bulk` | `GET /v2/orders` (lookup) | Resolving order_number → order_id |
-| `POST /api/ship-bulk` | `POST /v2/shipments/book` (per order) | Booking each order (auto-courier) |
-| `POST /api/ship-bulk` | `POST /v2/shipments/labels` | Generating merged label PDF |
-| `POST /api/ship-bulk` | `POST /v2/shipments/pickup` (optional) | Requesting courier pickup |
-| `GET /api/orders/lookup/:num` | `GET /v2/orders` | Single order validation |
+### Component 1: WhatsApp Client
 
-### Auto-Courier Allocation
+#### [NEW] `server/src/whatsapp.ts`
 
-By **omitting `courier_id`** from the `POST /v2/shipments/book` request, NimbusPost automatically allocates the **top-ranked serviceable courier** from your priority rules:
-
-```
-Your priority rules (set in NimbusPost dashboard):
-1. Delhivery Surface DT
-2. Bluedart Brand
-3. Delhivery Surface DT_Stressed
-4. Xpressbees Surface
-5. Xpressbees Surface_Stressed
-6. Delhivery Air
-7. Bluedart Brand Air
-```
-
-So if Delhivery Surface DT can service the pincode, it picks that. If not, it falls to Bluedart, then Xpressbees, etc. **No extra API call needed** — NimbusPost handles the priority logic on their end.
+Sending messages via WhatsApp API:
+- `sendText(phone, text)` — plain text reply
+- `sendInteractiveButtons(phone, body, buttons[])` — for yes/no, NDR choices
+- `sendListMessage(phone, body, rows[])` — for the 6-option menu
+- Webhook signature verification
+- Rate limiting (WhatsApp: 80 msgs/sec)
 
 ---
 
-## Auth System (Simple)
+### Component 2: Message Router
 
-Since it's just 2-3 team members:
+#### [NEW] `server/src/whatsapp-router.ts`
 
-- **Users stored in a JSON file** (or SQLite) — no need for a full database
-- **JWT tokens** — login once, token valid for 7 days
-- **Password hashing** with bcrypt
-- **No signup flow** — you create user accounts manually (or via a setup script)
+The brain of the bot. Handles every incoming message:
 
 ```typescript
-// users.json
-[
-  { "id": 1, "username": "admin", "passwordHash": "...", "role": "admin" },
-  { "id": 2, "username": "packer1", "passwordHash": "...", "role": "packer" }
-]
+async function handleIncomingMessage(phone: string, text: string) {
+  // 1. Check for active conversation
+  const convo = await store.getConversation(phone);
+  
+  if (convo && !isExpired(convo)) {
+    // Resume: we're in the middle of a flow
+    return resumeConversation(convo, text);
+  }
+
+  // 2. Fresh message — try keyword classification
+  const intent = classifyIntent(text);
+  const orderNumber = extractOrderNumber(text);
+
+  if (intent === "unknown") {
+    // 3. Didn't understand → show menu
+    await sendMenu(phone);
+    await store.saveConversation(phone, { step: "waiting_menu" });
+    return;
+  }
+
+  if (orderNumber) {
+    // 4. Got intent + order number → handle immediately
+    return routeToHandler(phone, intent, orderNumber);
+  }
+
+  // 5. Got intent but no order number → ask for it
+  await askForOrderNumber(phone, intent);
+  await store.saveConversation(phone, { 
+    intent, step: "waiting_order" 
+  });
+}
 ```
 
-Roles:
-- **admin** — can ship, view history, manage settings
-- **packer** — can scan and ship only
+**Keyword matching** (EN + Hindi + Hinglish):
+
+| Intent | Keywords |
+|--------|----------|
+| `confirm_order` | confirm, pakka, order confirm, mera order aaya, placed, order hua |
+| `change_address` | address, phone, number, change, update, badlo, galat address, wrong address |
+| `order_status` | status, tracking, kaha hai, where, track, kab aayega, kab milega, kidhar |
+| `not_dispatched` | dispatch, ship, sent, bheja, kab bhejoge, nahi bheja, why not shipped |
+| `order_failed` | fail, failed, deliver nahi, nahi mila, attempt, undelivered, return ho gaya |
+| `refund_return` | refund, return, missing, galat, wrong item, paisa wapas, nahi aaya, rakhi nahi |
+
+If the customer just sends a number 1-6 → map to intent directly.
 
 ---
 
-## QR Code Sticker
+### Component 3: Intent Handlers
 
-The QR code will contain just the order number text:
+#### [NEW] `server/src/handlers/confirm-order.ts`
+- Shopify lookup → NimbusPost status check → formatted reply with items, amount, address, courier, ETA
 
-```
-QR Code Data: "RBD4023"
-```
+#### [NEW] `server/src/handlers/order-status.ts`  
+- NimbusPost tracking → formatted status with location, ETA, tracking link
 
-- No prefix, no URL scheme — just the plain order number
-- App validates it matches the pattern `RBD` followed by digits
-- If someone scans a random QR code (like a URL), the app rejects it
+#### [NEW] `server/src/handlers/change-address.ts`
+- Multi-step: collect new address → collect phone → confirm → execute (cancel+recreate or NDR action)
 
-### Validation regex:
+#### [NEW] `server/src/handlers/not-dispatched.ts`
+- Check NimbusPost order state → give appropriate "your order is being processed" message
+
+#### [NEW] `server/src/handlers/order-failed.ts`
+- NimbusPost NDR lookup → show reason → offer 3 choices (re-attempt / update address / RTO)
+
+#### [NEW] `server/src/handlers/refund-return.ts`
+- Collect order number → look up in Shopify → send formatted message with order details + support phone number
+- Log in `support_tickets` table
+- Optionally notify the support number about incoming query
+
+---
+
+### Component 4: Shopify Client
+
+#### [NEW] `server/src/shopify.ts`
+
 ```typescript
-const ORDER_PATTERN = /^#?RBD\d+$/i;
-// Matches: RBD4023, #RBD4023, rbd4023
-// Rejects: https://google.com, random text, etc.
+class ShopifyClient {
+  // Find order by name (#RBD5001)
+  getOrderByName(name: string): Promise<ShopifyOrder | null>
+  
+  // Find orders by customer phone (for no-order-number fallback)
+  getOrdersByPhone(phone: string): Promise<ShopifyOrder[]>
+  
+  // Update shipping address (pre-dispatch only)
+  updateOrderAddress(orderId: string, address: Address): Promise<void>
+}
 ```
 
 ---
 
-## Edge Cases & Error Handling
+### Component 5: Conversation State
 
-| Scenario | Handling |
-|----------|---------|
-| **Duplicate scan** | Red flash + "Already scanned" buzzer. Order not added twice. |
-| **Invalid QR** | Red flash + "Not a valid order number" toast |
-| **Order not found in NimbusPost** | Marked as ❌ in results: "Order RBD4023 not found" |
-| **Order already shipped** | Marked as ⚠️ in results: "Already booked (AWB: XYZ)" |
-| **Order cancelled** | Marked as ❌: "Order was cancelled" |
-| **No serviceable courier** | Marked as ❌: "No courier available for pincode XXXXXX" |
-| **Rate limit (429)** | Auto-retry with backoff, progress shows "Retrying..." |
-| **Network failure mid-batch** | Save partial progress, show "Resume" button |
-| **Insufficient wallet** | Show NimbusPost error: "Insufficient balance" |
-| **Partial success** | Split results: ✅ shipped + ❌ failed with per-order reasons |
+#### [NEW] `server/src/conversation.ts`
+
+PostgreSQL-backed conversation state:
+
+```sql
+CREATE TABLE IF NOT EXISTS wa_conversations (
+  phone       TEXT PRIMARY KEY,
+  intent      TEXT,
+  step        TEXT NOT NULL,
+  context     JSONB NOT NULL DEFAULT '{}',
+  updated_at  TIMESTAMPTZ DEFAULT NOW(),
+  expires_at  TIMESTAMPTZ NOT NULL  -- 30 min from last activity
+);
+```
+
+Methods: `getConversation`, `saveConversation`, `clearConversation`, `cleanExpired`
 
 ---
 
-## Concurrency Strategy for Bulk Booking
+### Component 6: Database
 
-For 50 orders, booking one-by-one would take ~30-50 seconds. Instead:
+#### [MODIFY] [store.ts](file:///d:/13_AutoShip/server/src/store.ts)
 
+Add tables:
+
+```sql
+-- Message log (all inbound + outbound messages for debugging)
+CREATE TABLE IF NOT EXISTS wa_messages (
+  id            BIGSERIAL PRIMARY KEY,
+  phone         TEXT NOT NULL,
+  direction     TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+  message_text  TEXT,
+  intent        TEXT,
+  order_number  TEXT,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS wa_messages_phone_idx ON wa_messages (phone, created_at DESC);
+
+-- Conversation state
+CREATE TABLE IF NOT EXISTS wa_conversations (
+  phone       TEXT PRIMARY KEY,
+  intent      TEXT,
+  step        TEXT NOT NULL,
+  context     JSONB NOT NULL DEFAULT '{}',
+  updated_at  TIMESTAMPTZ DEFAULT NOW(),
+  expires_at  TIMESTAMPTZ NOT NULL
+);
+
+-- Support tickets (for escalated refund/return/missing queries)
+CREATE TABLE IF NOT EXISTS support_tickets (
+  ticket_id    TEXT PRIMARY KEY,
+  phone        TEXT NOT NULL,
+  order_number TEXT,
+  category     TEXT NOT NULL,  -- 'refund', 'return', 'missing', 'other'
+  description  TEXT,
+  status       TEXT NOT NULL DEFAULT 'open',
+  created_at   TIMESTAMPTZ DEFAULT NOW(),
+  resolved_at  TIMESTAMPTZ
+);
 ```
-Concurrency: 5 parallel requests at a time
-50 orders ÷ 5 parallel = 10 batches
-~200ms per request = ~2 seconds per batch
-Total: ~4-6 seconds for 50 orders + 1 label call
-
-With retry on 429: add ~2-3 seconds worst case
-Total: 5-10 seconds for 50 orders
-```
-
-Progress bar on frontend: `Shipping 23/50...`
 
 ---
 
-## Tech Stack Details
+### Component 7: Server Wiring
 
-### Frontend
-| Library | Purpose |
-|---------|---------|
-| **React 18** | UI framework |
-| **Vite** | Build tool + dev server |
-| **TypeScript** | Type safety |
-| **React Router v6** | Page routing |
-| **html5-qrcode** | Camera-based QR scanning |
-| **axios** | HTTP client |
-| **react-hot-toast** | Toast notifications |
-| **vite-plugin-pwa** | PWA support (installable, offline) |
+#### [MODIFY] [app.ts](file:///d:/13_AutoShip/server/src/app.ts)
 
-### Backend
-| Library | Purpose |
-|---------|---------|
-| **Express** | HTTP server |
-| **TypeScript** | Type safety |
-| **axios** | NimbusPost API client |
-| **jsonwebtoken** | JWT auth |
-| **bcrypt** | Password hashing |
-| **better-sqlite3** or **lowdb** | Lightweight data storage |
-| **p-limit** | Concurrency control for bulk booking |
-| **dotenv** | Environment variables |
-| **cors** | CORS headers for frontend |
+Add WhatsApp webhook routes (no JWT auth — verified by WhatsApp signature):
+
+```typescript
+// Webhook verification handshake
+app.get("/api/whatsapp/webhook", verifyWebhook);
+
+// Incoming messages
+app.post("/api/whatsapp/webhook", verifySignature, handleWebhook);
+```
+
+#### [MODIFY] `.env`
+
+```env
+# WhatsApp
+WHATSAPP_PHONE_NUMBER_ID=...
+WHATSAPP_ACCESS_TOKEN=...
+WHATSAPP_VERIFY_TOKEN=...
+WHATSAPP_APP_SECRET=...
+
+# Shopify
+SHOPIFY_STORE_URL=your-store.myshopify.com
+SHOPIFY_ACCESS_TOKEN=shpat_...
+
+# Support escalation
+SUPPORT_PHONE_NUMBER=919876543210   # for refund/return/missing forwarding
+```
+
+---
+
+### Component 8: Dashboard (Phase 3)
+
+#### [MODIFY] `client/src/App.tsx`
+
+Add "Support" tab:
+- Live message feed (wa_messages)
+- Ticket list (support_tickets) with open/resolved filter
+- Daily stats: auto-resolved vs escalated
+- Per-phone conversation history
+
+---
+
+## Automation Breakdown
+
+```
+ ~1000 msgs/day
+      │
+      ▼
+ ┌────────────────────────────┐
+ │  Bot auto-resolves (~75%)  │
+ │  • Order confirmation      │──► Instant reply (< 5 sec)
+ │  • Order status/tracking   │
+ │  • Why not dispatched      │
+ │  • Failed delivery + NDR   │
+ │    re-attempt              │
+ ├────────────────────────────┤
+ │  Bot handles with steps    │
+ │  (~15%)                    │──► 2-3 messages back and forth
+ │  • Address change (pre-    │
+ │    dispatch)               │
+ │  • NDR address update      │
+ ├────────────────────────────┤
+ │  Forward to human (10%)    │
+ │  • Refund requests         │──► Bot collects order#, then
+ │  • Return requests         │    sends customer to
+ │  • Missing/wrong items     │    SUPPORT_PHONE_NUMBER
+ │  • Address change (in-     │
+ │    transit, not NDR)       │
+ └────────────────────────────┘
+
+ Estimated savings: ~6-8 hours/day of manual work
+ Human only handles: ~100 msgs/day (refunds + edge cases)
+```
 
 ---
 
 ## Build Phases
 
-### Phase 1 — Core MVP (Ship-by-Scan)
-> Get the core scanning → shipping → labels flow working end-to-end.
+### Phase 1 — Core Bot
+- WhatsApp webhook + signature verification
+- Menu system + keyword classification
+- Order number extraction + phone number fallback (Shopify)
+- Shopify client
+- Handlers: confirm order, order status, not dispatched
+- Conversation state (PostgreSQL)
+- Basic text replies
 
-- [ ] **Backend:** Express server setup, NimbusPost API client, `.env` config
-- [ ] **Backend:** `POST /api/ship-bulk` — resolve order numbers, book, return results + label URL
-- [ ] **Backend:** Order number → order ID resolution (test which NimbusPost filters work)
-- [ ] **Frontend:** Login page (simple JWT auth)
-- [ ] **Frontend:** Scan page — QR scanner + scanned order list + duplicate rejection
-- [ ] **Frontend:** Ship page — "Ship All" button, progress bar, results (success/error split)
-- [ ] **Frontend:** Label download button (opens merged PDF)
-- [ ] **PWA:** Manifest + service worker for installability
+### Phase 2 — Full Flows
+- Handler: change address (multi-step)
+- Handler: order failed + NDR actions
+- Handler: refund/return → forward to support phone
+- Interactive buttons (WhatsApp)
+- Message logging (wa_messages)
+- Support tickets
 
-### Phase 2 — Polish & UX
-> Make it fast and pleasant to use.
-
-- [ ] Audio feedback (success beep, error buzzer, completion chime)
-- [ ] Vibration feedback on phone
-- [ ] Manual order entry (type order number, for desktop or when QR won't scan)
-- [ ] Remove orders from scanned list (swipe on mobile, delete button on desktop)
-- [ ] Responsive design polish (works great on both phone and desktop)
-- [ ] "Retry Failed" button for partially failed batches
-- [ ] Real-time counter with visual progress
-
-### Phase 3 — History & Management
-> Track what's been shipped and by whom.
-
-- [ ] Shipping batch history (who shipped, when, how many, success rate)
-- [ ] History page with filters (by date, by user)
-- [ ] User management (admin can add/remove packers)
-- [ ] Settings page (view API connection status, account info)
-
-### Phase 4 — Power Features (Future)
-> Nice-to-haves for later.
-
-- [ ] Auto-trigger pickup request after bulk shipping
-- [ ] QR code sticker generator (generate + print stickers from within AutoShip)
-- [ ] Dashboard with daily/weekly shipping analytics
-- [ ] Offline scanning with background sync when back online
-- [ ] Webhook integration for real-time tracking updates
-- [ ] Export shipping data to CSV/Excel
+### Phase 3 — Dashboard
+- Support tab in AutoShip web UI
+- Message feed, ticket list, stats
+- Conversation history viewer
 
 ---
 
-## Deployment Options
+## Effort Estimate
 
-| Option | Monthly Cost | Notes |
-|--------|-------------|-------|
-| **Vercel (frontend) + Railway (backend)** | ₹0 | Both have free tiers. Easiest. |
-| **Single VPS (DigitalOcean/Hostinger)** | ₹300-500 | Both frontend + backend on one server |
-| **Vercel (frontend) + Vercel Serverless (backend)** | ₹0 | Can use Vercel API routes, but less control |
-| **Self-hosted (your own machine)** | ₹0 | Free but need to keep machine running |
-
-**Recommended for MVP:** Vercel (free) for frontend + Railway (free) for backend. Zero cost to start.
-
----
-
-## Remaining Open Questions
-
-> [!IMPORTANT]
-> ### 1. Order Number Pattern Confirmation
-> Your order numbers always start with `RBD` followed by digits (e.g., `RBD4023`)? Are there any other patterns like `RBD-4023` or `RBDS4023` or different prefixes we should handle?
-
-> [!IMPORTANT]
-> ### 2. Sticker Printing
-> Who/what generates the current stickers (the white label with the order number)? Is it:
-> - A Shopify app that prints packing slips?
-> - A thermal label printer with custom software?
-> - Manual writing?
-> 
-> Asking because if we know the tool, we can potentially add QR code generation into your existing sticker workflow rather than building a separate sticker printer.
-
-> [!IMPORTANT]
-> ### 3. Database Choice
-> For 2-3 users and shipping history, we can use:
-> - **SQLite** (lightweight file-based database, zero setup) — recommended
-> - **JSON files** (even simpler but less queryable)
-> - **PostgreSQL/MySQL** (overkill for this scale)
-> 
-> I'd go with SQLite unless you have a preference.
+| Component | Effort |
+|-----------|--------|
+| WhatsApp client + webhook + signature | ~3h |
+| Shopify client | ~2h |
+| Message router + keyword classifier + menu | ~3h |
+| Order identification flow (RBD# + phone fallback) | ~2h |
+| Conversation state machine | ~2h |
+| 6 intent handlers | ~6h |
+| Database tables + store methods | ~2h |
+| Tests | ~3h |
+| Dashboard (Phase 3) | ~4h |
+| **Total** | **~27h** |
 
 ---
 
-## Summary
+## Files Reference
 
-**What we're building:** A TypeScript React + Node.js web app where you scan QR codes on your phone to collect order numbers, hit one button to bulk-ship them all through NimbusPost, and download/print the labels — on either your phone or desktop.
+| File | Change |
+|------|--------|
+| [NEW] `server/src/whatsapp.ts` | WhatsApp API client (send messages, verify signatures) |
+| [NEW] `server/src/whatsapp-router.ts` | Message pipeline: classify → collect order# → route |
+| [NEW] `server/src/shopify.ts` | Shopify Admin API client (order lookup by name/phone) |
+| [NEW] `server/src/conversation.ts` | Conversation state machine (PostgreSQL-backed) |
+| [NEW] `server/src/handlers/confirm-order.ts` | Order confirmation handler |
+| [NEW] `server/src/handlers/order-status.ts` | Tracking status handler |
+| [NEW] `server/src/handlers/change-address.ts` | Address/phone change (multi-step) |
+| [NEW] `server/src/handlers/not-dispatched.ts` | Dispatch inquiry handler |
+| [NEW] `server/src/handlers/order-failed.ts` | Failed delivery + NDR actions |
+| [NEW] `server/src/handlers/refund-return.ts` | Collect order# → forward to support phone |
+| [MODIFY] [app.ts](file:///d:/13_AutoShip/server/src/app.ts) | Add webhook routes |
+| [MODIFY] [store.ts](file:///d:/13_AutoShip/server/src/store.ts) | Add wa_messages, wa_conversations, support_tickets tables |
+| [MODIFY] [types.ts](file:///d:/13_AutoShip/server/src/types.ts) | Add WhatsApp + Shopify types |
+| [MODIFY] `.env` | Add WhatsApp + Shopify + support phone credentials |
 
-**What makes it work:** NimbusPost's `POST /v2/shipments/book` (auto-allocates courier from your priority rules when you omit `courier_id`) + `POST /v2/shipments/labels` (merges all labels into one PDF).
+## Out of Scope
 
-**Cost:** ₹0/month on free hosting tiers.
-
-**Time to build:** Phase 1 (working MVP) in ~1 week, Phase 2 (polished) in ~1 more week.
+- AI/LLM-based classification (keyword matching is enough for 6 clear categories)
+- Proactive shipping update messages (future: via NimbusPost webhooks)
+- WhatsApp catalog / product browsing
+- Payment processing via WhatsApp
+- Automated refund processing (requires human judgment)

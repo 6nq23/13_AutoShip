@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { PostgresStore } from "./store.js";
 import bcrypt from "bcryptjs";
-import type { Batch, ShippingJob } from "./types.js";
+import type { Batch, ShippingJob, SupportTicket } from "./types.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const describeWithPostgres = databaseUrl ? describe : describe.skip;
@@ -41,5 +41,16 @@ describeWithPostgres("PostgresStore", () => {
     expect((await store!.getActiveShippingJob(username))?.jobId).toBe(job.jobId);
     job.status = "completed"; job.updatedAt = new Date().toISOString(); await store!.updateShippingJob(job);
     expect((await store!.getShippingJob(job.jobId))?.status).toBe("completed");
+
+    const phone = `9${String(Date.now()).slice(-9)}`;
+    expect(await store!.addWhatsAppMessage({ phone, direction: "inbound", text: "track RBD9001", providerMessageId: `test-${Date.now()}` })).toBe(true);
+    await store!.saveConversation({ phone, intent: "order_status", step: "waiting_order", context: {} });
+    expect((await store!.getConversation(phone))?.intent).toBe("order_status");
+    const ticket: SupportTicket = { ticketId: crypto.randomUUID(), phone, orderNumber: "#RBD9001", category: "other", status: "open", createdAt: new Date().toISOString() };
+    await store!.createSupportTicket(ticket);
+    expect((await store!.getSupportOverview()).tickets.some((item) => item.ticketId === ticket.ticketId)).toBe(true);
+    expect(await store!.updateSupportTicket(ticket.ticketId, "resolved")).toBe(true);
+    await store!.clearConversation(phone);
+    expect(await store!.getConversation(phone)).toBeUndefined();
   });
 });
