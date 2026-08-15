@@ -1,6 +1,31 @@
 # AutoShip
 
-AutoShip turns `RBD` order QR codes into booked NimbusPost shipments and one merged label bundle. The React PWA talks to an Express API; PostgreSQL stores users, cached NimbusPost order IDs, and shipping history.
+AutoShip turns `RBD` order QR codes into booked NimbusPost shipments and one merged label bundle. The React PWA talks to an Express API; Prisma and PostgreSQL store users, cached NimbusPost order IDs, shipping jobs, and shipping history. The backend can run locally or as one Vercel Node.js serverless function.
+
+## Prisma database
+
+The local development database is configured as:
+
+```dotenv
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/auto_aync_prisma?schema=public"
+```
+
+Create the database once, then apply the Prisma schema and seed the initial admin:
+
+```bash
+PGPASSWORD=postgres createdb -h localhost -U postgres auto_aync_prisma
+npm run init-db -w server
+```
+
+Useful Prisma commands:
+
+```bash
+npm run db:push -w server
+npm run db:studio -w server
+npm run db:generate -w server
+```
+
+The Prisma schema is in `server/prisma/schema.prisma`. It owns all four application tables: `users`, `order_cache`, `shipping_jobs`, and `shipping_batches`.
 
 ## First-time PostgreSQL setup (Windows)
 
@@ -10,11 +35,10 @@ PostgreSQL 18 is already running on this machine. Open PowerShell and connect as
 & "D:\07_EXE\PostgreSQL\18\bin\psql.exe" -U postgres -h localhost -d postgres -W
 ```
 
-Enter the PostgreSQL administrator password, then run these two SQL statements using a strong password of your choice:
+Enter the PostgreSQL administrator password, then create the local database if it does not already exist:
 
 ```sql
-CREATE USER autoship WITH PASSWORD 'replace_with_a_strong_password';
-CREATE DATABASE autoship OWNER autoship;
+CREATE DATABASE auto_aync_prisma;
 \q
 ```
 
@@ -26,14 +50,18 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Set `DATABASE_URL` in `.env` with the same password:
+Set `DATABASE_URL` in `.env`:
 
 ```dotenv
-DATABASE_URL=postgresql://autoship:YOUR_PASSWORD@localhost:5432/autoship
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/auto_aync_prisma?schema=public"
 DATABASE_SSL=false
 ```
 
+<<<<<<< HEAD
 AutoShip creates its user, shipping, WhatsApp conversation/message, and support-ticket tables on the first server start.
+=======
+Run `npm run init-db -w server` after changing `DATABASE_URL`; Prisma creates the tables and the seed step creates the initial admin when the user table is empty.
+>>>>>>> d13b0bc7d7b1b18c0539c414b10e70561277620e
 
 ## Start AutoShip
 
@@ -101,6 +129,31 @@ Point the provider webhook at `POST /api/whatsapp/webhook`:
 - Getgabs: set `WHATSAPP_PROVIDER=getgabs`, `WHATSAPP_API_KEY`, `WHATSAPP_API_URL`, `WHATSAPP_SENDER`, `WHATSAPP_CAMPAIGN_ID`, and a separate `WHATSAPP_VERIFY_TOKEN`. Configure the Getgabs incoming-chat webhook as `https://YOUR_AUTOSHIP_HOST/api/whatsapp/webhook?token=YOUR_VERIFY_TOKEN`. AutoShip sends dynamic bot responses through Getgabs' service-message endpoint during the open 24-hour customer-service window. To initiate an approved template message, also set `WHATSAPP_TEMPLATE_NAME` and optionally `WHATSAPP_TEMPLATE_LANGUAGE` (defaults to `en_US`).
 
 The bot supports order confirmation, address/phone changes with explicit confirmation, tracking, not-dispatched checks, NDR actions, and refund/return/missing-item escalation. Before exposing or changing an order, AutoShip verifies that the WhatsApp sender matches an order, shipping, billing, or customer phone in Shopify. Conversation state expires after 24 hours, provider message IDs are deduplicated, and all Support API routes are admin-only.
+
+## Deploy the backend to Vercel
+
+Create a Vercel project with `server` as its Root Directory. `server/vercel.json` routes every request to the Express function at `server/api/index.ts`; Prisma Client is generated during install/build. Shipment jobs are registered with Vercel `waitUntil()` so the existing `202` response and frontend polling flow continue to work after the response is sent.
+
+Set these Vercel environment variables:
+
+```dotenv
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE?schema=public
+DATABASE_SSL=true
+CLIENT_ORIGIN=http://localhost:5173,https://auto-ship-client.vercel.app
+JWT_SECRET=a-random-secret-at-least-32-characters-long
+INITIAL_ADMIN_PASSWORD=a-strong-initial-password
+NIMBUS_API_KEY=npk_your_key
+NIMBUS_API_SECRET=your_secret
+NIMBUS_API_URL=https://api-v2.nimbuspost.com
+NIMBUS_LOOKUP_MAX_PAGES=20
+MOCK_MODE=false
+```
+
+The localhost database URL is only for local development: a Vercel function cannot connect to PostgreSQL running on your computer. Use a hosted PostgreSQL URL for Preview and Production, then apply `server/prisma/migrations` to that database before serving traffic.
+
+The production client uses `VITE_API_URL=https://auto-ship-backend.vercel.app` from `client/.env.production`. Local development leaves the base URL empty and continues using Vite's `/api` proxy to `http://localhost:8787`.
+
+Vercel function execution is capped at the configured 300 seconds. Very large or slow live shipment batches should eventually move to a durable queue/worker so they are not interrupted by the function timeout.
 
 ## Courier priority
 

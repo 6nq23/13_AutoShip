@@ -1,7 +1,11 @@
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+import { createApp } from "./app.js";
+import { loadConfig } from "./config.js";
+
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
-import { createApp } from "./app.js";
 
 const rootDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 dotenv.config({ path: path.join(rootDirectory, ".env") });
@@ -42,4 +46,5 @@ const app = await createApp({
   whatsappTemplateLanguage: process.env.WHATSAPP_TEMPLATE_LANGUAGE || "en_US",
   supportPhone: process.env.SUPPORT_PHONE_NUMBER || process.env.Phonenumber,
 });
-const port = Number(process.env.PORT || 8787); app.listen(port, () => console.log(`AutoShip API listening on http://localhost:${port}`));
+const port = Number(process.env.PORT || 8787);
+app.listen(port, () => console.log(`AutoShip API listening on http://localhost:${port}`));

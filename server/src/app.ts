@@ -1,12 +1,28 @@
 import path from "node:path";
+import fs from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
+import { waitUntil } from "@vercel/functions";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
+import {
+  contentSecurityPolicy,
+  crossOriginOpenerPolicy,
+  originAgentCluster,
+  referrerPolicy,
+  strictTransportSecurity,
+  xContentTypeOptions,
+  xDnsPrefetchControl,
+  xDownloadOptions,
+  xFrameOptions,
+  xPermittedCrossDomainPolicies,
+  xXssProtection,
+} from "helmet";
+import { rateLimit } from "express-rate-limit";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
-import { PostgresStore, type Store } from "./store.js";
+import { PrismaStore, type Store } from "./store.js";
+import { loadConfig } from "./config.js";
 import { NimbusClient } from "./nimbus.js";
 import { ShopifyClient } from "./shopify.js";
 import { WhatsAppClient, type WhatsAppProvider } from "./whatsapp.js";
@@ -23,14 +39,45 @@ export type AppConfig = {
   supportPhone?: string;
 };
 
-export async function createApp(config: AppConfig, storeOverride?: Store) {
-  const store = storeOverride || new PostgresStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword); await store.init();
+type BackgroundScheduler = (task: Promise<void>) => void;
+
+export async function createApp(config: AppConfig, storeOverride?: Store, scheduleBackground?: BackgroundScheduler) {
+  const store = storeOverride || new PrismaStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword); await store.init();
+  const runInBackground: BackgroundScheduler = scheduleBackground || ((task) => { void task.catch((error) => console.error("Background task failed", error)); });
   const nimbus = new NimbusClient({ apiUrl: config.nimbusApiUrl, apiKey: config.nimbusApiKey, apiSecret: config.nimbusApiSecret, maxPages: config.maxLookupPages, mockMode: config.mockMode }, { getOrderId: (order) => store.getOrderId(order), cacheOrder: (order, id) => store.cacheOrder(order, id) });
   const shopify = new ShopifyClient({ storeDomain: config.shopifyStoreDomain || "", clientId: config.shopifyClientId || "", clientSecret: config.shopifyClientSecret || "", accessToken: config.shopifyAccessToken, apiVersion: config.shopifyApiVersion, mockMode: config.mockMode });
   const whatsapp = new WhatsAppClient({ provider: config.whatsappProvider || "disabled", accessToken: config.whatsappAccessToken || "", phoneNumberId: config.whatsappPhoneNumberId, verifyToken: config.whatsappVerifyToken, appSecret: config.whatsappAppSecret, apiUrl: config.whatsappApiUrl, serviceApiUrl: config.whatsappServiceApiUrl, sender: config.whatsappSender, campaignId: config.whatsappCampaignId, templateName: config.whatsappTemplateName, templateLanguage: config.whatsappTemplateLanguage, mockMode: config.mockMode });
   const whatsappRouter = new WhatsAppRouter({ store, shopify, nimbus, whatsapp, supportPhone: config.supportPhone || "" });
+  
+  const allowedOrigins = new Set([
+    "http://localhost:5173",
+    "https://auto-ship-client.vercel.app",
+    ...config.clientOrigin.split(",").map((origin) => origin.trim().replace(/\/$/, "")).filter(Boolean),
+  ]);
   const app = express();
-  app.disable("x-powered-by"); app.use(helmet({ crossOriginResourcePolicy: false })); app.use(cors({ origin: config.clientOrigin, credentials: false })); app.use(express.json({ limit: "32kb", verify: (request, _response, buffer) => { (request as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer); } }));
+  app.set("trust proxy", 1);
+  app.disable("x-powered-by");
+  app.use(
+    contentSecurityPolicy(),
+    crossOriginOpenerPolicy(),
+    originAgentCluster(),
+    referrerPolicy(),
+    strictTransportSecurity(),
+    xContentTypeOptions(),
+    xDnsPrefetchControl(),
+    xDownloadOptions(),
+    xFrameOptions(),
+    xPermittedCrossDomainPolicies(),
+    xXssProtection(),
+  );
+  app.use(cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.has(origin.replace(/\/$/, ""))) return callback(null, true);
+      return callback(null, false);
+    },
+    credentials: false,
+  }));
+  app.use(express.json({ limit: "32kb", verify: (request, _response, buffer) => { (request as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer); } }));
   const authenticate = (request: AuthRequest, response: Response, next: NextFunction) => { const token = request.headers.authorization?.replace(/^Bearer\s+/i, ""); if (!token) return response.status(401).json({ error: "Please sign in to continue." }); try { request.auth = jwt.verify(token, config.jwtSecret) as { username: string; role: Role }; next(); } catch { response.status(401).json({ error: "Your session has expired. Please sign in again." }); } };
   const adminOnly = (request: AuthRequest, response: Response, next: NextFunction) => request.auth?.role === "admin" ? next() : response.status(403).json({ error: "Admin access is required." });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: "draft-7", legacyHeaders: false });
@@ -50,7 +97,7 @@ export async function createApp(config: AppConfig, storeOverride?: Store) {
     if (runningJobs.has(jobId)) return; runningJobs.add(jobId);
     let job: ShippingJob | undefined;
     try {
-      job = await store.getShippingJob(jobId); if (!job || job.status === "completed" || job.status === "failed") return;
+      job = await store.claimShippingJob(jobId); if (!job || job.status === "completed" || job.status === "failed") return;
       if (job.status === "processing" && job.processed > 0) { job.processed = 0; job.shipped = []; job.failed = []; job.labelUrl = null; appendLog(job, "info", "Server restarted; safely rechecking every order before continuing."); }
       job.status = "processing"; appendLog(job, "info", `Shipment started for ${job.total} order${job.total === 1 ? "" : "s"}.`); await store.updateShippingJob(job);
       let persistence = Promise.resolve();
@@ -117,7 +164,7 @@ export async function createApp(config: AppConfig, storeOverride?: Store) {
       const active = await store.getActiveShippingJob(request.auth!.username); if (active) return response.status(409).json({ error: "A shipment is already running for this account.", job: active });
       const now = new Date().toISOString(); const job: ShippingJob = { jobId: crypto.randomUUID(), createdAt: now, updatedAt: now, createdBy: request.auth!.username, status: "queued", orderNumbers, processed: 0, total: orderNumbers.length, shipped: [], failed: [], labelUrl: null, logs: [{ at: now, level: "info", message: `Shipment job created for ${orderNumbers.length} order${orderNumbers.length === 1 ? "" : "s"}.` }] };
       if (!(await store.createShippingJob(job))) { const existing = await store.getActiveShippingJob(request.auth!.username); return response.status(409).json({ error: "A shipment is already running for this account.", job: existing }); }
-      response.status(202).json({ job }); void processJob(job.jobId);
+      response.status(202).json({ job }); runInBackground(processJob(job.jobId));
     } catch (error) { next(error); }
   });
   app.get("/api/shipping-jobs/active", authenticate, async (request: AuthRequest, response, next) => { try { response.json({ job: await store.getActiveShippingJob(request.auth!.username) || null }); } catch (error) { next(error); } });
@@ -145,8 +192,33 @@ export async function createApp(config: AppConfig, storeOverride?: Store) {
   app.get("/api/settings/status", authenticate, adminOnly, (_request, response) => response.json({ connected: !config.mockMode && Boolean(config.nimbusApiKey && config.nimbusApiSecret), demoMode: config.mockMode, apiUrl: config.nimbusApiUrl, database: "PostgreSQL", support: { whatsapp: whatsapp.connected, shopify: shopify.connected } }));
   app.get("/demo-labels", (_request, response) => response.type("html").send("<title>AutoShip demo labels</title><style>body{font-family:system-ui;padding:40px}code{font-size:18px}</style><h1>Demo label bundle</h1><p>Live mode returns NimbusPost’s merged PDF here.</p>"));
 
-  const clientDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../client/dist"); app.use(express.static(clientDist)); app.get("*", (request, response, next) => request.path.startsWith("/api/") ? next() : response.sendFile(path.join(clientDist, "index.html")));
+  const clientDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../client/dist");
+  if (fs.existsSync(path.join(clientDist, "index.html"))) {
+    app.use(express.static(clientDist));
+    app.get("*", (request, response, next) => request.path.startsWith("/api/") ? next() : response.sendFile(path.join(clientDist, "index.html")));
+  } else {
+    app.get("/", (_request, response) => response.json({ message: "AutoShip API", health: "/api/health" }));
+  }
   app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => { console.error(error); response.status(500).json({ error: "The request could not be completed. Please try again." }); });
-  for (const pendingJob of await store.getPendingShippingJobs()) void processJob(pendingJob.jobId);
+  for (const pendingJob of await store.getPendingShippingJobs()) runInBackground(processJob(pendingJob.jobId));
   return app;
+}
+
+let serverlessAppPromise: ReturnType<typeof createApp> | undefined;
+
+/**
+ * Vercel's Express auto-detection treats src/app.ts as a function entrypoint.
+ * Keep initialization lazy so importing this module during the build does not
+ * connect to PostgreSQL, and reuse the Express app across warm invocations.
+ */
+export default async function handler(request: IncomingMessage, response: ServerResponse) {
+  if (!serverlessAppPromise) {
+    serverlessAppPromise = createApp(loadConfig(), undefined, (task) => waitUntil(task)).catch((error) => {
+      serverlessAppPromise = undefined;
+      throw error;
+    });
+  }
+
+  const app = await serverlessAppPromise;
+  return app(request, response);
 }
