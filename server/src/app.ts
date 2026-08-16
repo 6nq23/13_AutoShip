@@ -106,7 +106,7 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
         if (event.type === "started") appendLog(job, "info", "Checking the order and contacting NimbusPost.", event.orderNumber);
         if (event.type === "courier_attempt") appendLog(job, "info", `Priority ${event.priority}/${event.total}: trying ${event.courierName} (courier ${event.courierId}, role ${event.roleId}).`, event.orderNumber);
         if (event.type === "courier_rejected") appendLog(job, "error", `Priority ${event.priority} ${event.courierName} rejected: [${event.code}] ${event.error}`, event.orderNumber);
-        if (event.type === "shipped") { job.shipped.push(event.item); job.processed = job.shipped.length + job.failed.length; appendLog(job, "success", `${event.item.alreadyBooked ? "Already booked" : "Booked"} with ${event.item.courier}; AWB ${event.item.awb}.`, event.orderNumber); }
+        if (event.type === "shipped") { job.shipped.push(event.item); job.processed = job.shipped.length + job.failed.length; if (event.item.warning) appendLog(job, "error", `[${event.item.warningCode || "SHIPMENT_WARNING"}] ${event.item.warning} Existing shipment recovered and counted as shipped.`, event.orderNumber); appendLog(job, "success", `${event.item.alreadyBooked ? "Already booked" : "Booked"} with ${event.item.courier}; AWB ${event.item.awb || "available in NimbusPost"}.`, event.orderNumber); }
         if (event.type === "failed") { job.failed.push(event.item); job.processed = job.shipped.length + job.failed.length; appendLog(job, "error", `[${event.item.code}] ${event.item.error}`, event.orderNumber); }
         if (event.type === "labels_started") appendLog(job, "info", `Generating labels for ${event.count} shipped order${event.count === 1 ? "" : "s"}.`);
         if (event.type === "labels_ready") { job.labelUrl = event.labelUrl; appendLog(job, "success", "Merged shipping labels are ready to download."); }
@@ -182,6 +182,15 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
     } catch (error) { next(error); }
   });
   app.get("/api/history", authenticate, async (_request, response, next) => { try { response.json({ batches: await store.getHistory() }); } catch (error) { next(error); } });
+  app.post("/api/history/:batchId/label", authenticate, async (request, response, next) => {
+    try {
+      const batch = (await store.getHistory()).find((item) => item.batchId === String(request.params.batchId));
+      if (!batch) return response.status(404).json({ error: "Shipping batch was not found." });
+      if (!batch.shipped.length) return response.status(400).json({ error: "This batch has no successful shipments to print." });
+      const labelUrl = await nimbus.generateLabels(batch.shipped.map((item) => item.orderId));
+      response.json({ labelUrl });
+    } catch (error) { next(error); }
+  });
   app.get("/api/support/overview", authenticate, adminOnly, async (_request, response, next) => { try { response.json({ ...(await store.getSupportOverview()), connections: { whatsapp: whatsapp.connected, shopify: shopify.connected, nimbus: config.mockMode || Boolean(config.nimbusApiKey && config.nimbusApiSecret) } }); } catch (error) { next(error); } });
   app.patch("/api/support/tickets/:ticketId", authenticate, adminOnly, async (request, response, next) => {
     try {

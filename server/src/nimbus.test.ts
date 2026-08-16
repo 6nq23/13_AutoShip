@@ -73,6 +73,27 @@ describe("Nimbus courier priority", () => {
     expect(result.failed).toEqual([{ orderNumber: "#RBD4035", code: "COURIER_PRIORITY_EXHAUSTED", error: expect.stringContaining(`All ${COURIER_PRIORITY.length} priority couriers rejected`) }]);
   });
 
+  it("recovers pickup_scheduled as successful, preserves the booking error, and generates its label", async () => {
+    const bookingIds: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v2/orders" && url.search) return json({ success: true, data: [{ order_id: "ORD-77", order_number: "#RBD4077", order_status: "created" }] });
+      if (url.pathname === "/v2/shipments/book") {
+        const body = JSON.parse(String(init?.body)) as { courier_id: string }; bookingIds.push(body.courier_id);
+        return json({ error: { code: "VALIDATION_FAILED", detail: 'Order cannot be booked - current status is "pickup_scheduled". Only orders in "created" status can be booked.' } }, 400);
+      }
+      if (url.pathname === "/v2/orders/ORD-77") return json({ success: true, data: { order_id: "ORD-77", order_number: "#RBD4077", order_status: "pickup_scheduled", shipment: { awb: "AWB-77", courier_name: "Bluedart Brand Air", amount: 96 } } });
+      if (url.pathname === "/v2/shipments/labels") return json({ success: true, data: { url: "https://labels.test/77.pdf" } });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    const result = await makeClient().shipMany(["#RBD4077"], 1);
+    expect(bookingIds).toEqual(COURIER_PRIORITY.map((courier) => courier.courierId));
+    expect(result.failed).toEqual([]);
+    expect(result.shipped).toEqual([expect.objectContaining({ orderNumber: "#RBD4077", orderId: "ORD-77", awb: "AWB-77", courier: "Bluedart Brand Air", cost: 96, alreadyBooked: true, warningCode: "PICKUP_ALREADY_SCHEDULED", warning: expect.stringContaining(`All ${COURIER_PRIORITY.length} priority couriers rejected this shipment`) })]);
+    expect(result.labelUrl).toBe("https://labels.test/77.pdf");
+  });
+
   it("processes a bulk batch with at most five orders concurrently", async () => {
     let activeBookings = 0; let maximumActiveBookings = 0;
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {

@@ -39,6 +39,11 @@ export class NimbusClient {
     return { shipped, failed, labelUrl };
   }
 
+  async generateLabels(orderIds: string[]) {
+    if (!orderIds.length) throw new AppError("NO_LABEL_ORDERS", "This batch has no shipped orders to print");
+    return this.labels(orderIds);
+  }
+
   async lookupOrder(orderNumber: string, signal = AbortSignal.timeout(20_000)) {
     const normalized = normalizeOrderNumber(orderNumber);
     if (!normalized) throw new AppError("INVALID_ORDER_NUMBER", "Enter an order number like #RBD5001");
@@ -144,7 +149,8 @@ export class NimbusClient {
     if (this.config.mockMode) return this.mockShip(orderNumber, onProgress);
     const order = await this.resolveOrder(orderNumber, signal);
     if (order.order_status === "cancelled") throw new AppError("ORDER_CANCELLED", "Order was cancelled");
-    if (order.order_status === "booked" && order.shipment?.awb) return { orderNumber, orderId: order.order_id, awb: order.shipment.awb, courier: order.shipment.courier_name || "Allocated courier", cost: order.shipment.price?.total || 0, alreadyBooked: true };
+    if (order.order_status === "booked" && order.shipment?.awb) return { orderNumber, orderId: order.order_id, awb: order.shipment.awb, courier: order.shipment.courier_name || "Allocated courier", cost: order.shipment.price?.total ?? order.shipment.amount ?? 0, alreadyBooked: true };
+    if (order.order_status?.toLowerCase() === "pickup_scheduled") return this.pickupScheduledShipment(orderNumber, order);
     const rejected: string[] = [];
     for (let index = 0; index < COURIER_PRIORITY.length; index++) {
       const courier = COURIER_PRIORITY[index]; await onProgress?.({ type: "courier_attempt", orderNumber, priority: index + 1, total: COURIER_PRIORITY.length, courierId: courier.courierId, courierName: courier.name, roleId: courier.roleId });
@@ -157,7 +163,25 @@ export class NimbusClient {
         if (["UNAUTHORIZED", "FORBIDDEN", "RATE_LIMITED", "TOO_MANY_REQUESTS", "HTTP_401", "HTTP_403", "HTTP_429"].includes(parsed.code)) throw error;
       }
     }
-    throw new AppError("COURIER_PRIORITY_EXHAUSTED", `All ${COURIER_PRIORITY.length} priority couriers rejected this shipment. ${rejected.at(-1) || "No courier was serviceable."}`);
+    const exhaustedError = `All ${COURIER_PRIORITY.length} priority couriers rejected this shipment. ${rejected.at(-1) || "No courier was serviceable."}`;
+    if (rejected.some((message) => /current status is\s*["']?pickup_scheduled/i.test(message))) {
+      const refreshed = await this.getOrder(order.order_id, signal);
+      if (refreshed.order_status?.toLowerCase() === "pickup_scheduled") return this.pickupScheduledShipment(orderNumber, refreshed, exhaustedError);
+    }
+    throw new AppError("COURIER_PRIORITY_EXHAUSTED", exhaustedError);
+  }
+
+  private pickupScheduledShipment(orderNumber: string, order: OrderMatch, warning?: string): ShippedOrder {
+    return {
+      orderNumber,
+      orderId: order.order_id,
+      awb: order.shipment?.awb || "",
+      courier: order.shipment?.courier_name || "Allocated courier",
+      cost: order.shipment?.price?.total ?? order.shipment?.amount ?? 0,
+      alreadyBooked: true,
+      warningCode: "PICKUP_ALREADY_SCHEDULED",
+      warning: warning || 'Order cannot be booked - current status is "pickup_scheduled". Only orders in "created" status can be booked. The existing shipment was kept as successful.',
+    };
   }
 
   private async resolveOrder(orderNumber: string, signal: AbortSignal): Promise<OrderMatch> {

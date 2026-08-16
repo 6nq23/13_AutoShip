@@ -1,6 +1,6 @@
 export type Role = "admin" | "packer";
 export type UserRecord = { id: number; username: string; passwordHash: string; role: Role };
-export type ShippedOrder = { orderNumber: string; orderId: string; awb: string; courier: string; cost: number; alreadyBooked?: boolean };
+export type ShippedOrder = { orderNumber: string; orderId: string; awb: string; courier: string; cost: number; alreadyBooked?: boolean; warningCode?: string; warning?: string };
 export type FailedOrder = { orderNumber: string; error: string; code: string };
 export type ShippingLog = { at: string; level: "info" | "success" | "error"; message: string; orderNumber?: string };
 export type Batch = { batchId: string; createdAt: string; shippedBy: string; shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; totalShipped: number; totalFailed: number; demoMode: boolean; logs?: ShippingLog[] };
@@ -38,7 +38,7 @@ export type OrderMatch = {
   shipping_address?: { name?: string; phone?: string | number; address?: string; city?: string; state?: string; pincode?: string | number };
   billing_address?: { phone?: string | number };
   items?: Array<{ name?: string; qty?: number }>;
-  shipment?: { awb?: string; courier_name?: string; price?: { total?: number }; label_url?: string };
+  shipment?: { awb?: string; courier_name?: string; price?: { total?: number }; amount?: number; label_url?: string };
 };
 
 export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return";

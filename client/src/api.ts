@@ -1,6 +1,6 @@
 export type Role = "admin" | "packer";
 export type User = { username: string; role: Role };
-export type ShippedOrder = { orderNumber: string; orderId: string; awb: string; courier: string; cost: number; alreadyBooked?: boolean };
+export type ShippedOrder = { orderNumber: string; orderId: string; awb: string; courier: string; cost: number; alreadyBooked?: boolean; warningCode?: string; warning?: string };
 export type FailedOrder = { orderNumber: string; error: string; code: string };
 export type ShippingLog = { at: string; level: "info" | "success" | "error"; message: string; orderNumber?: string };
 export type ShipResult = { shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; totalShipped: number; totalFailed: number; batchId: string; demoMode: boolean; logs?: ShippingLog[] };
@@ -44,6 +44,7 @@ export const api = {
   shippingJob: (jobId: string) => request<{ job: ShippingJob }>(`/api/shipping-jobs/${encodeURIComponent(jobId)}`),
   activeShippingJob: () => request<{ job: ShippingJob | null }>("/api/shipping-jobs/active"),
   history: () => request<{ batches: HistoryItem[] }>("/api/history"),
+  historyLabel: (batchId: string) => request<{ labelUrl: string }>(`/api/history/${encodeURIComponent(batchId)}/label`, { method: "POST" }),
   status: () => request<{ connected: boolean; demoMode: boolean; apiUrl: string; database: string }>("/api/settings/status"),
   supportOverview: () => request<SupportOverview>("/api/support/overview"),
   updateSupportTicket: (ticketId: string, status: SupportTicket["status"]) => request<{ updated: boolean }>(`/api/support/tickets/${encodeURIComponent(ticketId)}`, { method: "PATCH", body: JSON.stringify({ status }) }),
