@@ -11,6 +11,28 @@ const makeClient = () => new NimbusClient(
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Nimbus courier priority", () => {
+  it("normalizes spaced and prefix-free customer order numbers before lookup", async () => {
+    const requested: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      requested.push(url.searchParams.get("order_number") || "");
+      return json({ success: true, data: [{ order_id: "ORD-5001", order_number: "#RBD5001", order_status: "created" }] });
+    }));
+
+    await expect(makeClient().lookupOrder("5 0 0 1")).resolves.toMatchObject({ order_id: "ORD-5001" });
+    expect(requested[0]).toBe("#RBD5001");
+  });
+
+  it("finds Nimbus orders by a customer phone across paginated order data", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.searchParams.get("page") === "1") return json({ success: true, data: Array.from({ length: 100 }, (_, index) => ({ order_id: `ORD-${index}`, order_number: `#RBD${index}`, shipping_address: { phone: "9000000000" } })), meta: { pagination: { totalPages: 2 } } });
+      return json({ success: true, data: [{ order_id: "ORD-TARGET", order_number: "#RBD5001", shipping_address: { phone: "+91 98765 43210" } }], meta: { pagination: { totalPages: 2 } } });
+    }));
+
+    await expect(makeClient().getOrdersByPhone("0091 98765 43210")).resolves.toMatchObject([{ order_number: "#RBD5001" }]);
+  });
+
   it("pins each courier_id in order and stops after the first success", async () => {
     const bookingBodies: Array<Record<string, string>> = []; const events: NimbusProgressEvent[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

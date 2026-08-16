@@ -1,13 +1,14 @@
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import type { AppConfig } from "./app.js";
 
-const serverDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-dotenv.config({ path: path.join(serverDirectory, ".env") });
-dotenv.config({ path: path.join(serverDirectory, "..", ".env") });
-
 export function loadConfig(): AppConfig {
+  // Keep imports side-effect free. The root project file is canonical; the
+  // server-local file only fills values that are absent there.
+  const workspaceDirectory = path.basename(process.cwd()).toLowerCase() === "server" ? path.resolve(process.cwd(), "..") : process.cwd();
+  dotenv.config({ path: path.join(workspaceDirectory, ".env") });
+  dotenv.config({ path: path.join(workspaceDirectory, "server", ".env") });
+
   const production = process.argv.includes("--production") || process.env.NODE_ENV === "production";
   const mockMode = process.env.MOCK_MODE === "true" || (!production && (!process.env.NIMBUS_API_KEY || !process.env.NIMBUS_API_SECRET));
 

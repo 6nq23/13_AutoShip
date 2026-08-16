@@ -1,14 +1,13 @@
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
 import { createApp } from "./app.js";
-import { loadConfig } from "./config.js";
 
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 
-const rootDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-dotenv.config({ path: path.join(rootDirectory, ".env") });
+// npm workspace scripts run with server/ as cwd, while direct development
+// commands often run from the repository root. Support both locations after compilation.
+const workspaceDirectory = path.basename(process.cwd()).toLowerCase() === "server" ? path.resolve(process.cwd(), "..") : process.cwd();
+dotenv.config({ path: path.join(workspaceDirectory, ".env") });
+dotenv.config({ path: path.join(workspaceDirectory, "server", ".env") });
 const production = process.argv.includes("--production") || process.env.NODE_ENV === "production";
 const mockMode = process.env.MOCK_MODE === "true" || (!production && (!process.env.NIMBUS_API_KEY || !process.env.NIMBUS_API_SECRET));
 const getgabsConfigured = process.env.WHATSAPP_API_URL?.includes("getgabs.com") || Boolean(process.env.WHATSAPP_SENDER || process.env.WHATSAPP_CAMPAIGN_ID);

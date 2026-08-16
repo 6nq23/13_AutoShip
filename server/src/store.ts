@@ -1,7 +1,7 @@
 import bcrypt from "bcryptjs";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { getPrisma } from "./db.js";
-import type { Batch, Role, ShippingJob, SupportConversation, SupportIntent, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
+import type { Batch, BotPause, Role, ShippingJob, SupportConversation, SupportIntent, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
 
 export interface Store {
   init(): Promise<void>;
@@ -22,6 +22,9 @@ export interface Store {
   getConversation(phone: string): Promise<SupportConversation | undefined>;
   saveConversation(conversation: Omit<SupportConversation, "updatedAt" | "expiresAt">): Promise<void>;
   clearConversation(phone: string): Promise<void>;
+  isBotPaused(phone: string): Promise<boolean>;
+  setBotPaused(phone: string, paused: boolean, reason?: BotPause["reason"]): Promise<void>;
+  isRecentBotMessage(phone: string, text: string): Promise<boolean>;
   createSupportTicket(ticket: SupportTicket): Promise<void>;
   updateSupportTicket(ticketId: string, status: SupportTicketStatus): Promise<boolean>;
   getSupportOverview(): Promise<SupportOverview>;
@@ -38,6 +41,45 @@ export class PrismaStore implements Store {
   }
 
   async init() {
+    // Older AutoShip installations created these columns as TEXT before the
+    // project moved to Prisma enums. Align that schema in place without
+    // deleting existing users, jobs, or shipment history.
+    await this.prisma.$executeRawUnsafe(`
+      DO $$ BEGIN
+        CREATE TYPE public."Role" AS ENUM ('admin', 'packer');
+      EXCEPTION WHEN duplicate_object THEN NULL;
+      END $$;
+      DO $$ BEGIN
+        CREATE TYPE public."ShippingJobStatus" AS ENUM ('queued', 'processing', 'completed', 'failed');
+      EXCEPTION WHEN duplicate_object THEN NULL;
+      END $$;
+      ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_role_check;
+      ALTER TABLE public.shipping_jobs DROP CONSTRAINT IF EXISTS shipping_jobs_status_check;
+      DROP INDEX IF EXISTS public.shipping_jobs_active_idx;
+      DROP INDEX IF EXISTS public.shipping_jobs_one_active_per_user_idx;
+      DO $$ BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'role' AND data_type = 'text'
+        ) THEN
+          ALTER TABLE public.users
+          ALTER COLUMN role TYPE public."Role" USING role::text::public."Role";
+        END IF;
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'shipping_jobs' AND column_name = 'status' AND data_type = 'text'
+        ) THEN
+          ALTER TABLE public.shipping_jobs
+          ALTER COLUMN status TYPE public."ShippingJobStatus" USING status::text::public."ShippingJobStatus";
+        END IF;
+      END $$;
+      ALTER TABLE public.shipping_jobs ADD COLUMN IF NOT EXISTS active_owner_key TEXT;
+      ALTER TABLE public.shipping_jobs ADD COLUMN IF NOT EXISTS lease_until TIMESTAMP(3);
+      CREATE UNIQUE INDEX IF NOT EXISTS shipping_jobs_active_owner_key_key ON public.shipping_jobs (active_owner_key);
+      CREATE INDEX IF NOT EXISTS shipping_jobs_created_by_updated_at_idx ON public.shipping_jobs (created_by, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS shipping_jobs_status_created_at_idx ON public.shipping_jobs (status, created_at);
+    `);
+
     await this.prisma.$executeRawUnsafe(`
       CREATE TABLE IF NOT EXISTS wa_messages (
         id BIGSERIAL PRIMARY KEY,
@@ -47,8 +89,11 @@ export class PrismaStore implements Store {
         intent TEXT,
         order_number TEXT,
         provider_message_id TEXT,
+        sender_type TEXT NOT NULL DEFAULT 'bot',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS sender_type TEXT NOT NULL DEFAULT 'bot';
+      UPDATE wa_messages SET sender_type = 'customer' WHERE direction = 'inbound' AND sender_type = 'bot';
       CREATE UNIQUE INDEX IF NOT EXISTS wa_messages_provider_id_idx ON wa_messages (provider_message_id) WHERE provider_message_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS wa_messages_phone_idx ON wa_messages (phone, created_at DESC);
       CREATE INDEX IF NOT EXISTS wa_messages_created_at_idx ON wa_messages (created_at DESC);
@@ -61,6 +106,13 @@ export class PrismaStore implements Store {
         expires_at TIMESTAMPTZ NOT NULL
       );
       CREATE INDEX IF NOT EXISTS wa_conversations_expires_idx ON wa_conversations (expires_at);
+      CREATE TABLE IF NOT EXISTS wa_bot_pauses (
+        phone TEXT PRIMARY KEY,
+        reason TEXT NOT NULL CHECK (reason IN ('manual', 'agent_message')),
+        paused_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS wa_bot_pauses_expires_idx ON wa_bot_pauses (expires_at);
       CREATE TABLE IF NOT EXISTS support_tickets (
         ticket_id UUID PRIMARY KEY,
         phone TEXT NOT NULL,
@@ -197,10 +249,10 @@ export class PrismaStore implements Store {
 
   async addWhatsAppMessage(message: Omit<WhatsAppMessage, "id" | "createdAt">) {
     const rowCount = await this.prisma.$executeRawUnsafe(
-      `INSERT INTO wa_messages (phone, direction, message_text, intent, order_number, provider_message_id)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO wa_messages (phone, direction, message_text, intent, order_number, provider_message_id, sender_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (provider_message_id) WHERE provider_message_id IS NOT NULL DO NOTHING`,
-      message.phone, message.direction, message.text, message.intent || null, message.orderNumber || null, message.providerMessageId || null,
+      message.phone, message.direction, message.text, message.intent || null, message.orderNumber || null, message.providerMessageId || null, message.source || (message.direction === "inbound" ? "customer" : "bot"),
     );
     return rowCount === 1;
   }
@@ -227,6 +279,40 @@ export class PrismaStore implements Store {
     await this.prisma.$executeRawUnsafe("DELETE FROM wa_conversations WHERE phone = $1", phone);
   }
 
+  async isBotPaused(phone: string) {
+    const rows = await this.prisma.$queryRawUnsafe<{ paused: boolean }[]>(
+      "SELECT EXISTS (SELECT 1 FROM wa_bot_pauses WHERE phone = $1 AND expires_at > NOW()) AS paused",
+      phone,
+    );
+    return Boolean(rows[0]?.paused);
+  }
+
+  async setBotPaused(phone: string, paused: boolean, reason: BotPause["reason"] = "manual") {
+    if (!paused) {
+      await this.prisma.$executeRawUnsafe("DELETE FROM wa_bot_pauses WHERE phone = $1", phone);
+      return;
+    }
+    await this.prisma.$executeRawUnsafe(
+      `INSERT INTO wa_bot_pauses (phone, reason, paused_at, expires_at)
+       VALUES ($1, $2, NOW(), NOW() + INTERVAL '24 hours')
+       ON CONFLICT (phone) DO UPDATE SET reason = EXCLUDED.reason, paused_at = NOW(), expires_at = NOW() + INTERVAL '24 hours'`,
+      phone, reason,
+    );
+    await this.clearConversation(phone);
+  }
+
+  async isRecentBotMessage(phone: string, text: string) {
+    const rows = await this.prisma.$queryRawUnsafe<{ found: boolean }[]>(
+      `SELECT EXISTS (
+         SELECT 1 FROM wa_messages
+         WHERE phone = $1 AND direction = 'outbound' AND sender_type = 'bot'
+           AND message_text = $2 AND created_at > NOW() - INTERVAL '5 minutes'
+       ) AS found`,
+      phone, text,
+    );
+    return Boolean(rows[0]?.found);
+  }
+
   async createSupportTicket(ticket: SupportTicket) {
     await this.prisma.$executeRawUnsafe(
       `INSERT INTO support_tickets (ticket_id, phone, order_number, category, description, status, created_at, resolved_at)
@@ -244,15 +330,18 @@ export class PrismaStore implements Store {
   }
 
   async getSupportOverview(): Promise<SupportOverview> {
-    const [messageResult, ticketResult, conversationResult, statsResult] = await Promise.all([
-      this.prisma.$queryRawUnsafe<{ id: bigint; phone: string; direction: WhatsAppMessage["direction"]; message_text: string; intent: SupportIntent | null; order_number: string | null; provider_message_id: string | null; created_at: Date }[]>(
-        "SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, created_at FROM wa_messages ORDER BY created_at DESC LIMIT 200",
+    const [messageResult, ticketResult, conversationResult, pauseResult, statsResult] = await Promise.all([
+      this.prisma.$queryRawUnsafe<{ id: bigint; phone: string; direction: WhatsAppMessage["direction"]; message_text: string; intent: SupportIntent | null; order_number: string | null; provider_message_id: string | null; sender_type: WhatsAppMessage["source"]; created_at: Date }[]>(
+        "SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, created_at FROM wa_messages ORDER BY created_at DESC LIMIT 200",
       ),
       this.prisma.$queryRawUnsafe<{ ticket_id: string; phone: string; order_number: string | null; category: SupportTicket["category"]; description: string | null; status: SupportTicketStatus; created_at: Date; resolved_at: Date | null }[]>(
         "SELECT ticket_id, phone, order_number, category, description, status, created_at, resolved_at FROM support_tickets ORDER BY created_at DESC LIMIT 100",
       ),
       this.prisma.$queryRawUnsafe<{ phone: string; intent: SupportIntent | null; step: SupportConversation["step"]; context: any; updated_at: Date; expires_at: Date }[]>(
         "SELECT phone, intent, step, context, updated_at, expires_at FROM wa_conversations WHERE expires_at > NOW() ORDER BY updated_at DESC LIMIT 100",
+      ),
+      this.prisma.$queryRawUnsafe<{ phone: string; reason: BotPause["reason"]; paused_at: Date; expires_at: Date }[]>(
+        "SELECT phone, reason, paused_at, expires_at FROM wa_bot_pauses WHERE expires_at > NOW() ORDER BY paused_at DESC LIMIT 200",
       ),
       this.prisma.$queryRawUnsafe<{ inbound_today: number; outbound_today: number; active_conversations: number; open_tickets: number }[]>(
         `SELECT
@@ -264,9 +353,10 @@ export class PrismaStore implements Store {
     ]);
     const stats = statsResult[0];
     return {
-      messages: messageResult.map((row: any) => ({ id: row.id.toString(), phone: row.phone, direction: row.direction, text: row.message_text, ...(row.intent ? { intent: row.intent } : {}), ...(row.order_number ? { orderNumber: row.order_number } : {}), ...(row.provider_message_id ? { providerMessageId: row.provider_message_id } : {}), createdAt: row.created_at.toISOString() })),
+      messages: messageResult.map((row: any) => ({ id: row.id.toString(), phone: row.phone, direction: row.direction, text: row.message_text, ...(row.intent ? { intent: row.intent } : {}), ...(row.order_number ? { orderNumber: row.order_number } : {}), ...(row.provider_message_id ? { providerMessageId: row.provider_message_id } : {}), ...(row.sender_type ? { source: row.sender_type } : {}), createdAt: row.created_at.toISOString() })),
       tickets: ticketResult.map((row: any) => ({ ticketId: row.ticket_id, phone: row.phone, ...(row.order_number ? { orderNumber: row.order_number } : {}), category: row.category, ...(row.description ? { description: row.description } : {}), status: row.status, createdAt: row.created_at.toISOString(), ...(row.resolved_at ? { resolvedAt: row.resolved_at.toISOString() } : {}) })),
       conversations: conversationResult.map((row: any) => ({ phone: row.phone, ...(row.intent ? { intent: row.intent } : {}), step: row.step, context: typeof row.context === "string" ? JSON.parse(row.context) : row.context, updatedAt: row.updated_at.toISOString(), expiresAt: row.expires_at.toISOString() })),
+      botPauses: pauseResult.map((row) => ({ phone: row.phone, reason: row.reason, pausedAt: row.paused_at.toISOString(), expiresAt: row.expires_at.toISOString() })),
       stats: { inboundToday: stats.inbound_today, outboundToday: stats.outbound_today, activeConversations: stats.active_conversations, openTickets: stats.open_tickets },
     };
   }

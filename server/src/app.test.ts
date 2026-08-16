@@ -3,7 +3,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "./app.js";
 import type { Store } from "./store.js";
-import type { Batch, ShippingJob, SupportConversation, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
+import type { Batch, BotPause, ShippingJob, SupportConversation, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
 
 class MemoryStore implements Store {
   private users: UserRecord[] = [];
@@ -13,6 +13,7 @@ class MemoryStore implements Store {
   private messages: WhatsAppMessage[] = [];
   private conversations = new Map<string, SupportConversation>();
   private tickets = new Map<string, SupportTicket>();
+  private botPauses = new Map<string, BotPause>();
   async init() { this.users = [{ id: 1, username: "admin", passwordHash: await bcrypt.hash("admin123", 4), role: "admin" }]; }
   async findUser(username: string) { return this.users.find((user) => user.username.toLowerCase() === username.toLowerCase()); }
   async createUser(username: string, passwordHash: string, role: UserRecord["role"]) {
@@ -24,6 +25,7 @@ class MemoryStore implements Store {
   async addBatch(batch: Batch) { this.history.unshift(batch); }
   async getHistory() { return this.history; }
   async createShippingJob(job: ShippingJob) { if ([...this.jobs.values()].some((item) => item.createdBy.toLowerCase() === job.createdBy.toLowerCase() && ["queued", "processing"].includes(item.status))) return false; this.jobs.set(job.jobId, structuredClone(job)); return true; }
+  async claimShippingJob(jobId: string) { const job = this.jobs.get(jobId); return job && ["queued", "processing"].includes(job.status) ? structuredClone(job) : undefined; }
   async updateShippingJob(job: ShippingJob) { this.jobs.set(job.jobId, structuredClone(job)); }
   async getShippingJob(jobId: string) { const job = this.jobs.get(jobId); return job ? structuredClone(job) : undefined; }
   async getActiveShippingJob(username: string) { const job = [...this.jobs.values()].find((item) => item.createdBy.toLowerCase() === username.toLowerCase() && ["queued", "processing"].includes(item.status)); return job ? structuredClone(job) : undefined; }
@@ -33,9 +35,12 @@ class MemoryStore implements Store {
   async getConversation(phone: string) { const conversation = this.conversations.get(phone); return conversation ? structuredClone(conversation) : undefined; }
   async saveConversation(conversation: Omit<SupportConversation, "updatedAt" | "expiresAt">) { const now = new Date(); this.conversations.set(conversation.phone, { ...structuredClone(conversation), updatedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 24 * 60 * 60_000).toISOString() }); }
   async clearConversation(phone: string) { this.conversations.delete(phone); }
+  async isBotPaused(phone: string) { return this.botPauses.has(phone); }
+  async setBotPaused(phone: string, paused: boolean, reason: BotPause["reason"] = "manual") { if (!paused) { this.botPauses.delete(phone); return; } const now = new Date(); this.botPauses.set(phone, { phone, reason, pausedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 24 * 60 * 60_000).toISOString() }); this.conversations.delete(phone); }
+  async isRecentBotMessage(phone: string, text: string) { return this.messages.some((message) => message.phone === phone && message.direction === "outbound" && message.source !== "agent" && message.text === text); }
   async createSupportTicket(ticket: SupportTicket) { this.tickets.set(ticket.ticketId, structuredClone(ticket)); }
   async updateSupportTicket(ticketId: string, status: SupportTicketStatus) { const ticket = this.tickets.get(ticketId); if (!ticket) return false; ticket.status = status; ticket.resolvedAt = status === "resolved" ? new Date().toISOString() : undefined; return true; }
-  async getSupportOverview(): Promise<SupportOverview> { return { messages: structuredClone(this.messages), tickets: structuredClone([...this.tickets.values()]), conversations: structuredClone([...this.conversations.values()]), stats: { inboundToday: this.messages.filter((message) => message.direction === "inbound").length, outboundToday: this.messages.filter((message) => message.direction === "outbound").length, activeConversations: this.conversations.size, openTickets: [...this.tickets.values()].filter((ticket) => ticket.status === "open").length } }; }
+  async getSupportOverview(): Promise<SupportOverview> { return { messages: structuredClone(this.messages), tickets: structuredClone([...this.tickets.values()]), conversations: structuredClone([...this.conversations.values()]), botPauses: structuredClone([...this.botPauses.values()]), stats: { inboundToday: this.messages.filter((message) => message.direction === "inbound").length, outboundToday: this.messages.filter((message) => message.direction === "outbound").length, activeConversations: this.conversations.size, openTickets: [...this.tickets.values()].filter((ticket) => ticket.status === "open").length } }; }
 }
 
 const config = {
@@ -91,5 +96,17 @@ describe("AutoShip API", () => {
     expect(missing.status).toBe(404);
     const invalid = await request(app).patch("/api/support/tickets/invalid").set("Authorization", `Bearer ${token}`).send({ status: "closed" });
     expect(invalid.status).toBe(400);
+  });
+  it("lets an admin pause and resume bot replies for a customer", async () => {
+    const app = await makeApp(); const token = await login(app); const phone = "919876543210";
+    const paused = await request(app).patch(`/api/support/bot-pauses/${phone}`).set("Authorization", `Bearer ${token}`).send({ paused: true });
+    expect(paused.status).toBe(200);
+    await request(app).post("/api/whatsapp/webhook").send({ id: "paused-customer-message", from: phone, text: "hello while agent is talking" });
+    const overview = await request(app).get("/api/support/overview").set("Authorization", `Bearer ${token}`);
+    expect(overview.body.botPauses).toEqual([expect.objectContaining({ phone })]);
+    expect(overview.body.messages.filter((message: WhatsAppMessage) => message.providerMessageId === "paused-customer-message")).toHaveLength(1);
+    expect(overview.body.messages.some((message: WhatsAppMessage) => message.direction === "outbound")).toBe(false);
+    const resumed = await request(app).patch(`/api/support/bot-pauses/${phone}`).set("Authorization", `Bearer ${token}`).send({ paused: false });
+    expect(resumed.status).toBe(200);
   });
 });

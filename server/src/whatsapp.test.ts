@@ -71,6 +71,14 @@ describe("Getgabs WhatsApp integration", () => {
     })).toEqual([{ id: "wamid.button", phone: "919876543210", text: "5" }]);
   });
 
+  it("separates manual outbound agent messages from customer messages", () => {
+    const client = new WhatsAppClient({ provider: "getgabs", accessToken: "key", mockMode: false });
+    const payload = { message_id: "wamid.agent", message_to: "919876543210", message_text: "I am checking this for you.", direction: "outbound" };
+
+    expect(client.extractMessages(payload)).toEqual([]);
+    expect(client.extractManualMessages(payload)).toEqual([{ id: "wamid.agent", phone: "919876543210", text: "I am checking this for you." }]);
+  });
+
   it("sends dynamic replies through the service-message endpoint without an Authorization header", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ messages: [{ id: "wamid.sent" }] }), { status: 200, headers: { "Content-Type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);

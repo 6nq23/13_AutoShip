@@ -78,6 +78,23 @@ export class WhatsAppClient {
     });
   }
 
+  extractManualMessages(body: unknown): IncomingWhatsAppMessage[] {
+    const payload = body as Record<string, unknown>;
+    if (payload.object === "whatsapp_business_account") return [];
+    const candidates = Array.isArray(payload.messages) ? payload.messages : [payload];
+    return candidates.flatMap((candidate) => {
+      const message = candidate as Record<string, unknown>;
+      const outbound = message.from_me === true || message.fromMe === true || String(message.direction || "").toLowerCase() === "outbound";
+      if (!outbound) return [];
+      const textObject = message.text as Record<string, unknown> | string | undefined;
+      const getgabsText = this.extractGetgabsText(message.message_text);
+      const text = typeof textObject === "string" ? textObject : String(textObject?.body || getgabsText || message.body || message.message || "");
+      const phone = String(message.to || message.message_to || message.recipient || message.chat_id || message.chatId || message.message_from || "").split("@")[0].replace(/\D/g, "");
+      const id = String(message.id || message.message_id || message.messageId || "");
+      return phone && text ? [{ id: id || crypto.randomUUID(), phone, text: text.trim() }] : [];
+    });
+  }
+
   async sendText(phone: string, text: string) {
     if (this.config.mockMode || this.config.provider === "disabled") { console.info(`[whatsapp:mock] ${phone}: ${text.replace(/\s+/g, " ").slice(0, 180)}`); return; }
     if (this.config.provider === "meta") {

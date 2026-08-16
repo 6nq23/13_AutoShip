@@ -7,13 +7,19 @@ export type ShipResult = { shipped: ShippedOrder[]; failed: FailedOrder[]; label
 export type HistoryItem = ShipResult & { createdAt: string; shippedBy: string };
 export type ShippingJob = { jobId: string; createdAt: string; updatedAt: string; createdBy: string; status: "queued" | "processing" | "completed" | "failed"; orderNumbers: string[]; processed: number; total: number; shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; logs: ShippingLog[]; error?: string; result?: ShipResult };
 export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return";
-export type WhatsAppMessage = { id: string; phone: string; direction: "inbound" | "outbound"; text: string; intent?: SupportIntent; orderNumber?: string; createdAt: string };
+export type WhatsAppMessage = { id: string; phone: string; direction: "inbound" | "outbound"; text: string; intent?: SupportIntent; orderNumber?: string; source?: "customer" | "bot" | "agent"; createdAt: string };
 export type SupportTicket = { ticketId: string; phone: string; orderNumber?: string; category: "refund" | "return" | "missing" | "other"; description?: string; status: "open" | "resolved"; createdAt: string; resolvedAt?: string };
 export type SupportConversation = { phone: string; intent?: SupportIntent; step: string; updatedAt: string; expiresAt: string };
-export type SupportOverview = { messages: WhatsAppMessage[]; tickets: SupportTicket[]; conversations: SupportConversation[]; stats: { inboundToday: number; outboundToday: number; activeConversations: number; openTickets: number }; connections: { whatsapp: boolean; shopify: boolean; nimbus: boolean } };
+export type BotPause = { phone: string; reason: "manual" | "agent_message"; pausedAt: string; expiresAt: string };
+export type SupportOverview = { messages: WhatsAppMessage[]; tickets: SupportTicket[]; conversations: SupportConversation[]; botPauses: BotPause[]; stats: { inboundToday: number; outboundToday: number; activeConversations: number; openTickets: number }; connections: { whatsapp: boolean; shopify: boolean; nimbus: boolean } };
 
 const TOKEN_KEY = "autoship_token";
-const API_BASE_URL = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+const configuredApiUrl = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+// A Quick Tunnel serves the built frontend and API from the same temporary
+// hostname. Do not let a production build send those browser requests to the
+// separately deployed Vercel API, where the tunnel origin would fail CORS.
+const isQuickTunnel = typeof window !== "undefined" && window.location.hostname.endsWith(".trycloudflare.com");
+const API_BASE_URL = isQuickTunnel ? "" : configuredApiUrl;
 export const getToken = () => localStorage.getItem(TOKEN_KEY);
 export const setToken = (token: string) => localStorage.setItem(TOKEN_KEY, token);
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
@@ -41,6 +47,7 @@ export const api = {
   status: () => request<{ connected: boolean; demoMode: boolean; apiUrl: string; database: string }>("/api/settings/status"),
   supportOverview: () => request<SupportOverview>("/api/support/overview"),
   updateSupportTicket: (ticketId: string, status: SupportTicket["status"]) => request<{ updated: boolean }>(`/api/support/tickets/${encodeURIComponent(ticketId)}`, { method: "PATCH", body: JSON.stringify({ status }) }),
+  setBotPaused: (phone: string, paused: boolean) => request<{ phone: string; paused: boolean }>(`/api/support/bot-pauses/${encodeURIComponent(phone)}`, { method: "PATCH", body: JSON.stringify({ paused }) }),
 };
 
 export function normalizeOrder(value: string) {

@@ -30,10 +30,19 @@ export type NimbusProgressEvent =
   | { type: "labels_started"; count: number }
   | { type: "labels_ready"; labelUrl: string }
   | { type: "labels_failed"; error: string };
-export type OrderMatch = { order_id: string; order_number: string; order_status?: string; shipment?: { awb?: string; courier_name?: string; price?: { total?: number }; label_url?: string } };
+export type OrderMatch = {
+  order_id: string;
+  order_number: string;
+  order_status?: string;
+  total_amount?: number;
+  shipping_address?: { name?: string; phone?: string | number; address?: string; city?: string; state?: string; pincode?: string | number };
+  billing_address?: { phone?: string | number };
+  items?: Array<{ name?: string; qty?: number }>;
+  shipment?: { awb?: string; courier_name?: string; price?: { total?: number }; label_url?: string };
+};
 
 export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return";
-export type ConversationStep = "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice";
+export type ConversationStep = "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_nimbus_verify" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice";
 export type SupportConversation = {
   phone: string;
   intent?: SupportIntent;
@@ -50,8 +59,10 @@ export type WhatsAppMessage = {
   intent?: SupportIntent;
   orderNumber?: string;
   providerMessageId?: string;
+  source?: "customer" | "bot" | "agent";
   createdAt: string;
 };
+export type BotPause = { phone: string; pausedAt: string; expiresAt: string; reason: "manual" | "agent_message" };
 export type SupportTicketStatus = "open" | "resolved";
 export type SupportTicket = {
   ticketId: string;
@@ -67,6 +78,7 @@ export type SupportOverview = {
   messages: WhatsAppMessage[];
   tickets: SupportTicket[];
   conversations: SupportConversation[];
+  botPauses: BotPause[];
   stats: { inboundToday: number; outboundToday: number; activeConversations: number; openTickets: number };
 };
 
@@ -95,6 +107,7 @@ export type ShopifyOrder = {
   shippingAddress?: ShopifyAddress;
   customerPhones?: string[];
   lineItems: Array<{ title: string; quantity: number; sku?: string }>;
+  trackingInfo?: Array<{ number?: string; url?: string; company?: string }>;
 };
 export type NimbusTracking = {
   orderId?: string;

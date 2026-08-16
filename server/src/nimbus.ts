@@ -1,4 +1,5 @@
 import type { FailedOrder, NimbusNdr, NimbusProgressEvent, NimbusTracking, OrderMatch, ShippedOrder, ShopifyAddress } from "./types.js";
+import { normalizeOrderNumber, normalizePhoneNumber } from "./identifiers.js";
 
 type NimbusConfig = { apiUrl: string; apiKey: string; apiSecret: string; maxPages: number; mockMode: boolean };
 type Envelope<T> = { success: true; data: T; meta?: { pagination?: { totalPages?: number } } };
@@ -38,7 +39,37 @@ export class NimbusClient {
     return { shipped, failed, labelUrl };
   }
 
-  async lookupOrder(orderNumber: string, signal = AbortSignal.timeout(20_000)) { return this.resolveOrder(this.normalizeOrderNumber(orderNumber), signal); }
+  async lookupOrder(orderNumber: string, signal = AbortSignal.timeout(20_000)) {
+    const normalized = normalizeOrderNumber(orderNumber);
+    if (!normalized) throw new AppError("INVALID_ORDER_NUMBER", "Enter an order number like #RBD5001");
+    return this.resolveOrder(normalized, signal);
+  }
+
+  async getOrdersByPhone(phone: string, signal = AbortSignal.timeout(20_000)) {
+    const normalized = normalizePhoneNumber(phone);
+    if (!normalized) return [];
+    const matches: OrderMatch[] = [];
+    const seen = new Set<string>();
+    for (let page = 1; page <= this.config.maxPages; page++) {
+      const response = await this.listOrders({ limit: "100", page: String(page) }, signal);
+      let phoneFields = 0;
+      let readablePhones = 0;
+      for (const order of response.data) {
+        const candidates = [order.shipping_address?.phone, order.billing_address?.phone].filter((candidate) => candidate !== undefined);
+        phoneFields += candidates.length;
+        readablePhones += candidates.filter((candidate) => Boolean(normalizePhoneNumber(String(candidate)))).length;
+        if (candidates.some((candidate) => normalizePhoneNumber(String(candidate)) === normalized) && !seen.has(order.order_id)) {
+          matches.push(order);
+          seen.add(order.order_id);
+        }
+      }
+      const totalPages = response.meta?.pagination?.totalPages;
+      // NimbusPost currently masks list/detail phone values. Do not scan more pages when none are searchable.
+      if (phoneFields > 0 && readablePhones === 0) break;
+      if ((totalPages !== undefined && page >= totalPages) || response.data.length < 100) break;
+    }
+    return matches.slice(0, 10);
+  }
 
   async track(awb: string) {
     if (this.config.mockMode) return { orderStatus: "booked", shipment: { awb, courierName: "Delhivery Surface", edd: new Date(Date.now() + 3 * 86_400_000).toISOString() }, latest: { shipStatus: "in transit", eventTime: new Date().toISOString(), location: "Bengaluru Hub", message: "In transit" } } satisfies NimbusTracking;
@@ -100,13 +131,13 @@ export class NimbusClient {
       if (!this.isDefinitiveCreateRejection(replacementError)) throw new AppError("REPLACEMENT_STATUS_UNKNOWN", `NimbusPost did not confirm whether the replacement order was created. AutoShip did not create another order; manual reconciliation is required. ${this.describeError(replacementError).error}`);
       try {
         const restored = await this.request<Envelope<OrderMatch>>("/v2/orders", { method: "POST", body: JSON.stringify(originalBody) });
-        await this.cache.cacheOrder(this.normalizeOrderNumber(orderNumber), restored.data.order_id).catch((error) => console.error("NimbusPost restored-order cache update failed", error));
+        await this.cache.cacheOrder(normalizeOrderNumber(orderNumber)!, restored.data.order_id).catch((error) => console.error("NimbusPost restored-order cache update failed", error));
       } catch (restoreError) {
         throw new AppError("REPLACEMENT_AND_RESTORE_FAILED", `NimbusPost cancelled the original order, then both replacement and automatic restoration failed: ${this.describeError(replacementError).error}; restore: ${this.describeError(restoreError).error}`);
       }
       throw new AppError("REPLACEMENT_FAILED_RESTORED", `NimbusPost rejected the new address, so AutoShip restored the original order: ${this.describeError(replacementError).error}`);
     }
-    await this.cache.cacheOrder(this.normalizeOrderNumber(orderNumber), replacement.data.order_id).catch((error) => console.error("NimbusPost replacement cache update failed", error));
+    await this.cache.cacheOrder(normalizeOrderNumber(orderNumber)!, replacement.data.order_id).catch((error) => console.error("NimbusPost replacement cache update failed", error));
   }
 
   private async shipOne(orderNumber: string, signal: AbortSignal, onProgress?: (event: NimbusProgressEvent) => Promise<void>): Promise<ShippedOrder> {
@@ -130,23 +161,20 @@ export class NimbusClient {
   }
 
   private async resolveOrder(orderNumber: string, signal: AbortSignal): Promise<OrderMatch> {
-    const canonical = (value: string) => `#${value.trim().replace(/^#/, "").toUpperCase()}`;
     const cached = await this.cache.getOrderId(orderNumber);
     if (cached) return this.getOrder(cached, signal);
     const exact = await this.listOrders({ order_number: orderNumber, limit: "100", page: "1" }, signal);
-    let match = exact.data.find((order) => order.order_number && canonical(order.order_number) === orderNumber);
+    let match = exact.data.find((order) => order.order_number && normalizeOrderNumber(order.order_number) === orderNumber);
     if (!match) {
       const pages = Math.min(exact.meta?.pagination?.totalPages || this.config.maxPages, this.config.maxPages);
       for (let page = 1; page <= pages && !match; page++) {
         const response = page === 1 ? exact : await this.listOrders({ limit: "100", page: String(page) }, signal);
-        match = response.data.find((order) => order.order_number && canonical(order.order_number) === orderNumber);
+        match = response.data.find((order) => order.order_number && normalizeOrderNumber(order.order_number) === orderNumber);
       }
     }
     if (!match) throw new AppError("NOT_FOUND", `Order ${orderNumber} was not found in NimbusPost`);
     await this.cache.cacheOrder(orderNumber, match.order_id); return match;
   }
-
-  private normalizeOrderNumber(value: string) { return `#${value.trim().replace(/^#/, "").toUpperCase()}`; }
 
   private listOrders(query: Record<string, string>, signal: AbortSignal) { return this.request<Envelope<OrderMatch[]>>(`/v2/orders?${new URLSearchParams(query)}`, {}, 0, signal); }
   private async getOrder(orderId: string, signal: AbortSignal) { return (await this.request<Envelope<OrderMatch>>(`/v2/orders/${encodeURIComponent(orderId)}`, {}, 0, signal)).data; }

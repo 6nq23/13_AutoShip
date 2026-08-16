@@ -2,7 +2,8 @@ import type { Store } from "./store.js";
 import type { NimbusClient } from "./nimbus.js";
 import type { ShopifyClient } from "./shopify.js";
 import type { IncomingWhatsAppMessage, WhatsAppClient } from "./whatsapp.js";
-import type { ShopifyAddress, ShopifyOrder, SupportConversation, SupportIntent, SupportTicket } from "./types.js";
+import type { OrderMatch, ShopifyAddress, ShopifyOrder, SupportConversation, SupportIntent, SupportTicket } from "./types.js";
+import { extractPhoneNumber, normalizeOrderNumber, normalizePhoneNumber } from "./identifiers.js";
 
 const INTENTS: Record<string, SupportIntent> = {
   "1": "confirm_order",
@@ -26,11 +27,8 @@ export const classifyIntent = (text: string): SupportIntent | undefined => {
   const menu = INTENTS[text.trim()];
   return menu || KEYWORDS.find(([, pattern]) => pattern.test(text))?.[0];
 };
-export const extractOrderNumber = (text: string) => text.match(/#?RBD\s*[- ]?\s*(\d+)/i)?.[1]?.replace(/^/, "#RBD").toUpperCase();
-export const extractPhoneNumber = (text: string) => {
-  const digits = text.replace(/\D/g, "");
-  return digits.length >= 10 && digits.length <= 13 ? digits.slice(-10) : undefined;
-};
+export const extractOrderNumber = normalizeOrderNumber;
+export { extractPhoneNumber };
 
 type RouterDependencies = { store: Store; shopify: ShopifyClient; nimbus: NimbusClient; whatsapp: WhatsAppClient; supportPhone: string };
 
@@ -46,11 +44,20 @@ export class WhatsAppRouter {
     try { await current; } finally { if (this.locks.get(message.phone) === current) this.locks.delete(message.phone); }
   }
 
+  async handleManualAgentMessage(message: IncomingWhatsAppMessage) {
+    const text = message.text.trim().slice(0, 2_000);
+    if (!text || await this.dependencies.store.isRecentBotMessage?.(message.phone, text)) return;
+    const inserted = await this.dependencies.store.addWhatsAppMessage({ phone: message.phone, direction: "outbound", source: "agent", text, providerMessageId: message.id });
+    if (!inserted) return;
+    await this.dependencies.store.setBotPaused?.(message.phone, true, "agent_message");
+  }
+
   private async process(message: IncomingWhatsAppMessage) {
     const text = message.text.trim().slice(0, 2_000);
     if (!text) return;
-    const inserted = await this.dependencies.store.addWhatsAppMessage({ phone: message.phone, direction: "inbound", text, providerMessageId: message.id });
+    const inserted = await this.dependencies.store.addWhatsAppMessage({ phone: message.phone, direction: "inbound", source: "customer", text, providerMessageId: message.id });
     if (!inserted) return;
+    if (await this.dependencies.store.isBotPaused?.(message.phone)) return;
     const conversation = await this.dependencies.store.getConversation(message.phone);
     if (conversation) return this.resume(conversation, text);
     const intent = classifyIntent(text);
@@ -84,10 +91,27 @@ export class WhatsAppRouter {
       return this.send(phone, "Sorry, I didn't understand. Please send an order number like RBD5001 or a 10-digit phone number.", intent);
     }
     if (step === "waiting_pick" && intent) {
-      const options = Array.isArray(context.orders) ? context.orders as Array<{ name: string }> : [];
+      const options = Array.isArray(context.orders) ? context.orders as Array<{ name: string; source?: "shopify" | "nimbus" }> : [];
       const selected = options[Number(text.trim()) - 1];
       if (!selected) return this.send(phone, `Reply with a number from 1 to ${options.length}.`, intent);
-      return this.dispatch(phone, intent, selected.name, context);
+      return this.dispatch(phone, intent, selected.name, { ...context, customerPhoneVerified: selected.source === "shopify" });
+    }
+    if (step === "waiting_nimbus_verify" && intent) {
+      const pincode = text.replace(/\D/g, "");
+      const orderNumber = String(context.orderNumber || "");
+      if (!/^\d{6}$/.test(pincode)) return this.send(phone, "Please reply with the 6-digit delivery PIN code for this order.", intent, orderNumber);
+      const order = await this.dependencies.nimbus.lookupOrder(orderNumber).catch(() => null);
+      const expectedPincode = String(order?.shipping_address?.pincode || "").replace(/\D/g, "");
+      if (!order || expectedPincode !== pincode) {
+        const retries = Number(context.retries || 0) + 1;
+        if (retries >= 3) {
+          await this.dependencies.store.clearConversation(phone);
+          return this.send(phone, `We couldn't verify that order. Please contact ${this.dependencies.supportPhone || "support"}.`, intent, orderNumber);
+        }
+        await this.save({ phone, intent, step, context: { ...context, retries } });
+        return this.send(phone, "That PIN code did not match the order. Please check the 6-digit delivery PIN code and try again.", intent, orderNumber);
+      }
+      return this.dispatch(phone, intent, orderNumber, { ...context, nimbusVerified: true });
     }
     if (step === "waiting_address" && intent === "change_address") {
       const parsed = parseAddress(text);
@@ -116,7 +140,7 @@ export class WhatsAppRouter {
     await this.dependencies.store.clearConversation(phone);
     if (preface) await this.send(phone, preface);
     await this.dependencies.whatsapp.sendMenu(phone);
-    await this.dependencies.store.addWhatsAppMessage({ phone, direction: "outbound", text: "Support menu: 1 Confirm, 2 Address, 3 Status, 4 Not dispatched, 5 Delivery failed, 6 Refund/return/missing" });
+    await this.dependencies.store.addWhatsAppMessage({ phone, direction: "outbound", source: "bot", text: "Support menu: 1 Confirm, 2 Address, 3 Status, 4 Not dispatched, 5 Delivery failed, 6 Refund/return/missing" });
     await this.save({ phone, step: "waiting_menu", context: {} });
   }
 
@@ -132,35 +156,53 @@ export class WhatsAppRouter {
 
   private async resolveIdentifier(phone: string, intent: SupportIntent, identifier: string, context: Record<string, unknown> = {}) {
     if (identifier.startsWith("#RBD")) return this.dispatch(phone, intent, identifier, context);
-    if (normalizePhone(identifier) !== normalizePhone(phone)) {
+    if (normalizePhoneNumber(identifier) !== normalizePhoneNumber(phone)) {
       await this.dependencies.store.clearConversation(phone);
       return this.send(phone, `For your security, order lookup must use the phone number connected to this WhatsApp chat. Please message us from the order phone or contact ${this.dependencies.supportPhone || "support"}.`);
     }
-    const orders = await this.dependencies.shopify.getOrdersByPhone(identifier);
+    const [shopifyOrders, nimbusOrders] = await Promise.all([
+      this.dependencies.shopify.getOrdersByPhone(identifier).catch((error) => { console.error(`[support:${phone}] Shopify phone lookup failed`, error); return []; }),
+      this.dependencies.nimbus.getOrdersByPhone(identifier).catch((error) => { console.error(`[support:${phone}] Nimbus phone lookup failed`, error); return []; }),
+    ]);
+    const orders = [
+      ...shopifyOrders.map((order) => ({ name: order.name, source: "shopify" as const, summary: formatShopifyOrderSummary(order) })),
+      ...nimbusOrders.map((order) => ({ name: order.order_number, source: "nimbus" as const, summary: `${order.items?.map((item) => `${item.name || "Item"} ×${item.qty || 1}`).join(", ") || "Order"}${order.order_status ? ` · ${humanStatus(order.order_status)}` : ""}` })),
+    ].filter((order, index, all) => all.findIndex((candidate) => candidate.name.toUpperCase() === order.name.toUpperCase()) === index);
     if (!orders.length) {
       await this.save({ phone, intent, step: "waiting_order", context: { ...context, retries: 1 } });
       return this.send(phone, "We couldn't find an order for that phone number. Check the number or send your RBD order number.", intent);
     }
-    if (orders.length === 1) return this.dispatch(phone, intent, orders[0].name, context);
+    if (orders.length === 1) return this.dispatch(phone, intent, orders[0].name, { ...context, customerPhoneVerified: orders[0].source === "shopify" });
     const visibleOrders = orders.slice(0, 9);
-    await this.save({ phone, intent, step: "waiting_pick", context: { ...context, orders: visibleOrders.map((order) => ({ name: order.name })) } });
-    const choices = orders.slice(0, 9).map((order, index) => `${index + 1}️⃣ ${order.name} — ${order.lineItems[0]?.title || "Order"} (${formatMoney(order)})`).join("\n");
+    await this.save({ phone, intent, step: "waiting_pick", context: { ...context, orders: visibleOrders.map((order) => ({ name: order.name, source: order.source })) } });
+    const choices = orders.slice(0, 9).map((order, index) => `${index + 1}️⃣ ${order.name} — ${order.summary}`).join("\n");
     await this.send(phone, `We found these orders:\n${choices}\nReply with the number.`, intent);
   }
 
   private async dispatch(phone: string, intent: SupportIntent, orderNumber: string, context: Record<string, unknown> = {}) {
     try {
-      const order = await this.requireShopifyOrder(orderNumber);
-      if (!this.orderBelongsToSender(order, phone)) {
+      const shopifyOrder = await this.dependencies.shopify.getOrderByName(orderNumber).catch((error) => { console.error(`[support:${phone}] Shopify order lookup failed`, error); return null; });
+      const nimbusOrder = shopifyOrder ? null : await this.dependencies.nimbus.lookupOrder(orderNumber).catch((error) => { console.error(`[support:${phone}] Nimbus order lookup failed`, error); return null; });
+      if (!shopifyOrder && !nimbusOrder) throw new Error(`Order ${orderNumber} was not found in Shopify or NimbusPost`);
+      if (!shopifyOrder && nimbusOrder && !this.nimbusHasReadablePhone(nimbusOrder) && context.nimbusVerified !== true) {
+        await this.save({ phone, intent, step: "waiting_nimbus_verify", context: { ...context, orderNumber: nimbusOrder.order_number, retries: 0 } });
+        return await this.send(phone, `We found ${nimbusOrder.order_number}. To verify it securely, please reply with the 6-digit delivery PIN code.`, intent, nimbusOrder.order_number);
+      }
+      const belongsToSender = shopifyOrder ? context.customerPhoneVerified === true || this.orderBelongsToSender(shopifyOrder, phone) : context.nimbusVerified === true || this.nimbusOrderBelongsToSender(nimbusOrder!, phone);
+      if (!belongsToSender) {
         await this.dependencies.store.clearConversation(phone);
         return await this.send(phone, `We couldn't verify that order against this WhatsApp number. Please message us from the phone used on the order or contact ${this.dependencies.supportPhone || "support"}.`);
       }
-      if (intent === "confirm_order") return await this.confirmOrder(phone, order);
-      if (intent === "order_status") return await this.orderStatus(phone, orderNumber);
-      if (intent === "not_dispatched") return await this.notDispatched(phone, orderNumber);
-      if (intent === "refund_return") return await this.refundReturn(phone, order, context.ticketCategory as SupportTicket["category"] | undefined);
-      if (intent === "change_address") return await this.beginAddressChange(phone, order);
-      return await this.orderFailed(phone, orderNumber);
+      if (intent === "confirm_order") return shopifyOrder ? await this.confirmOrder(phone, shopifyOrder) : await this.confirmNimbusOrder(phone, nimbusOrder!);
+      if (intent === "order_status") return await this.orderStatus(phone, orderNumber, shopifyOrder || undefined, nimbusOrder || undefined);
+      if (intent === "not_dispatched") return await this.notDispatched(phone, orderNumber, shopifyOrder || undefined, nimbusOrder || undefined);
+      if (intent === "refund_return") return shopifyOrder ? await this.refundReturn(phone, shopifyOrder, context.ticketCategory as SupportTicket["category"] | undefined) : await this.refundNimbusOrder(phone, nimbusOrder!, context.ticketCategory as SupportTicket["category"] | undefined);
+      if (intent === "change_address") {
+        if (shopifyOrder) return await this.beginAddressChange(phone, shopifyOrder);
+        await this.dependencies.store.clearConversation(phone);
+        return await this.send(phone, `We found ${nimbusOrder!.order_number}, but it is not linked to the configured Shopify store, so the bot cannot safely change its address. Please contact ${this.dependencies.supportPhone || "support"}.`, intent, nimbusOrder!.order_number);
+      }
+      return await this.orderFailed(phone, orderNumber, nimbusOrder || undefined);
     } catch (error) {
       console.error(`[support:${phone}] ${intent} failed`, error);
       await this.save({ phone, intent, step: "waiting_order", context: { retries: 0 } });
@@ -177,26 +219,40 @@ export class WhatsAppRouter {
     await this.send(phone, `✅ Order ${order.name} is confirmed!\n📦 Items: ${items}\n💰 Total: ${formatMoney(order)} (${order.displayFinancialStatus || "payment status unavailable"})\n📍 Shipping to: ${shipping}${courier}`, "confirm_order", order.name);
   }
 
-  private async orderStatus(phone: string, orderNumber: string) {
-    const order = await this.dependencies.nimbus.lookupOrder(orderNumber);
-    if (!order.shipment?.awb) { await this.dependencies.store.clearConversation(phone); return this.send(phone, `📦 ${orderNumber} is ${order.order_status || "being processed"}. Tracking will appear after courier booking.`, "order_status", orderNumber); }
-    const tracking = await this.dependencies.nimbus.track(order.shipment.awb);
-    const status = tracking.latest?.shipStatus || tracking.orderStatus || order.order_status || "processing";
-    const location = tracking.latest?.location ? `\n📍 Current location: ${tracking.latest.location}` : "";
-    const eta = tracking.shipment?.edd ? `\n📅 Expected delivery: ${formatDate(tracking.shipment.edd)}` : "";
+  private async confirmNimbusOrder(phone: string, order: OrderMatch) {
+    const items = order.items?.map((item) => `${item.name || "Item"} ×${item.qty || 1}`).join(", ") || "Order items available in NimbusPost";
+    const courier = order.shipment?.courier_name ? `\n🚚 Courier: ${order.shipment.courier_name}` : "";
     await this.dependencies.store.clearConversation(phone);
-    await this.send(phone, `${statusEmoji(status)} ${humanStatus(status)}${location}${eta}\n🚚 ${tracking.shipment?.courierName || order.shipment.courier_name || "Courier"}\n🔎 AWB: ${order.shipment.awb}`, "order_status", orderNumber);
+    await this.send(phone, `✅ Order ${order.order_number} is confirmed!\n📦 Items: ${items}\n📍 Status: ${humanStatus(order.order_status || "created")}${courier}`, "confirm_order", order.order_number);
   }
 
-  private async notDispatched(phone: string, orderNumber: string) {
-    const order = await this.dependencies.nimbus.lookupOrder(orderNumber).catch((error: unknown) => {
+  private async orderStatus(phone: string, orderNumber: string, shopifyOrder?: ShopifyOrder, resolvedNimbusOrder?: OrderMatch) {
+    const order = resolvedNimbusOrder || await this.dependencies.nimbus.lookupOrder(orderNumber).catch((error) => { console.error(`[support:${phone}] Nimbus order lookup failed; using Shopify status`, error); return null; });
+    const shopifyTracking = shopifyOrder?.trackingInfo?.find((item) => item.number || item.url);
+    const awb = order?.shipment?.awb || shopifyTracking?.number;
+    if (!awb) {
+      const status = order?.order_status || shopifyOrder?.displayFulfillmentStatus || "being processed";
+      await this.dependencies.store.clearConversation(phone);
+      return this.send(phone, `📦 ${orderNumber} is ${humanStatus(status)}. Tracking will appear after courier booking.`, "order_status", orderNumber);
+    }
+    const tracking = await this.dependencies.nimbus.track(awb).catch((error) => { console.error(`[support:${phone}] Nimbus tracking lookup failed; using available shipment data`, error); return null; });
+    const status = tracking?.latest?.shipStatus || tracking?.orderStatus || order?.order_status || shopifyOrder?.displayFulfillmentStatus || "processing";
+    const location = tracking?.latest?.location ? `\n📍 Current location: ${tracking.latest.location}` : "";
+    const eta = tracking?.shipment?.edd ? `\n📅 Expected delivery: ${formatDate(tracking.shipment.edd)}` : "";
+    const trackingLink = shopifyTracking?.url ? `\n🔗 Track shipment: ${shopifyTracking.url}` : "";
+    await this.dependencies.store.clearConversation(phone);
+    await this.send(phone, `${statusEmoji(status)} ${humanStatus(status)}${location}${eta}\n🚚 ${tracking?.shipment?.courierName || order?.shipment?.courier_name || shopifyTracking?.company || "Courier"}\n🔎 AWB: ${awb}${trackingLink}`, "order_status", orderNumber);
+  }
+
+  private async notDispatched(phone: string, orderNumber: string, shopifyOrder?: ShopifyOrder, resolvedNimbusOrder?: OrderMatch) {
+    const order = resolvedNimbusOrder || await this.dependencies.nimbus.lookupOrder(orderNumber).catch((error: unknown) => {
       if (typeof error === "object" && error !== null && "code" in error && error.code === "NOT_FOUND") return null;
       throw error;
     });
     await this.dependencies.store.clearConversation(phone);
     if (!order) return this.send(phone, `Your order ${orderNumber} is being processed by our team and should be prepared within 24–48 hours. We'll share tracking once dispatched. 📦`, "not_dispatched", orderNumber);
     const status = (order.order_status || "created").toLowerCase();
-    if (order.shipment?.awb || /shipped|transit|picked/.test(status)) return this.orderStatus(phone, orderNumber);
+    if (order.shipment?.awb || shopifyOrder?.trackingInfo?.some((item) => item.number) || /shipped|transit|picked/.test(status)) return this.orderStatus(phone, orderNumber, shopifyOrder, order);
     const response = status === "booked" ? `Your order is booked with ${order.shipment?.courier_name || "the courier"}. Pickup is scheduled.` : status === "created" ? "Your order is ready and queued for shipping. Courier pickup should happen today or tomorrow. 🚛" : `Your order is currently ${status}. We'll share tracking after dispatch.`;
     await this.send(phone, response, "not_dispatched", orderNumber);
   }
@@ -206,6 +262,13 @@ export class WhatsAppRouter {
     await this.dependencies.store.createSupportTicket(ticket);
     await this.dependencies.store.clearConversation(phone);
     await this.send(phone, `We found ${order.name} (${order.lineItems.map((item) => `${item.title} ×${item.quantity}`).join(", ")}, ${formatMoney(order)}).\n\nFor refund, return, or missing-item help, please WhatsApp/call ${this.dependencies.supportPhone || "our support team"} and mention order ${order.name}. Ticket ${ticket.ticketId.slice(0, 8)} has been logged. 🙏`, "refund_return", order.name);
+  }
+
+  private async refundNimbusOrder(phone: string, order: OrderMatch, category: SupportTicket["category"] = "other") {
+    const ticket: SupportTicket = { ticketId: crypto.randomUUID(), phone, orderNumber: order.order_number, category, description: "Refund, return, missing, or wrong-item request received on WhatsApp for a NimbusPost order", status: "open", createdAt: new Date().toISOString() };
+    await this.dependencies.store.createSupportTicket(ticket);
+    await this.dependencies.store.clearConversation(phone);
+    await this.send(phone, `We found ${order.order_number}. Ticket ${ticket.ticketId.slice(0, 8)} has been logged. Please WhatsApp/call ${this.dependencies.supportPhone || "our support team"} and mention the order number for refund or return help. 🙏`, "refund_return", order.order_number);
   }
 
   private async beginAddressChange(phone: string, shopifyOrder: ShopifyOrder) {
@@ -255,8 +318,8 @@ export class WhatsAppRouter {
     await this.send(phone, context.branch === "ndr" ? "✅ Address updated in Shopify and re-delivery has been requested." : "✅ Address updated. The replacement NimbusPost order will use the new address.", "change_address", orderNumber);
   }
 
-  private async orderFailed(phone: string, orderNumber: string) {
-    const order = await this.dependencies.nimbus.lookupOrder(orderNumber);
+  private async orderFailed(phone: string, orderNumber: string, resolvedNimbusOrder?: OrderMatch) {
+    const order = resolvedNimbusOrder || await this.dependencies.nimbus.lookupOrder(orderNumber);
     const awb = order.shipment?.awb;
     if (!awb) { await this.dependencies.store.clearConversation(phone); return this.send(phone, `Order ${orderNumber} has no courier shipment yet, so there is no failed delivery to action.`, "order_failed", orderNumber); }
     const ndr = await this.dependencies.nimbus.getNdr(awb);
@@ -288,14 +351,25 @@ export class WhatsAppRouter {
   }
 
   private orderBelongsToSender(order: ShopifyOrder, phone: string) {
-    const sender = normalizePhone(phone);
+    const sender = normalizePhoneNumber(phone);
     const candidates = order.customerPhones?.length ? order.customerPhones : [order.shippingAddress?.phone].filter((candidate): candidate is string => Boolean(candidate));
-    return Boolean(sender && candidates.some((candidate) => normalizePhone(candidate) === sender));
+    return Boolean(sender && candidates.some((candidate) => normalizePhoneNumber(candidate) === sender));
+  }
+
+  private nimbusOrderBelongsToSender(order: OrderMatch, phone: string) {
+    const sender = normalizePhoneNumber(phone);
+    const candidates = [order.shipping_address?.phone, order.billing_address?.phone].filter((candidate) => candidate !== undefined);
+    return Boolean(sender && candidates.some((candidate) => normalizePhoneNumber(String(candidate)) === sender));
+  }
+
+  private nimbusHasReadablePhone(order: OrderMatch) {
+    const candidates = [order.shipping_address?.phone, order.billing_address?.phone].filter((candidate) => candidate !== undefined);
+    return candidates.some((candidate) => Boolean(normalizePhoneNumber(String(candidate))));
   }
 
   private async send(phone: string, text: string, intent?: SupportIntent, orderNumber?: string) {
     await this.dependencies.whatsapp.sendText(phone, text);
-    await this.dependencies.store.addWhatsAppMessage({ phone, direction: "outbound", text, ...(intent ? { intent } : {}), ...(orderNumber ? { orderNumber } : {}) });
+    await this.dependencies.store.addWhatsAppMessage({ phone, direction: "outbound", source: "bot", text, ...(intent ? { intent } : {}), ...(orderNumber ? { orderNumber } : {}) });
   }
 
   private save(conversation: Omit<SupportConversation, "updatedAt" | "expiresAt">) { return this.dependencies.store.saveConversation(conversation); }
@@ -310,10 +384,17 @@ function parseAddress(text: string): ShopifyAddress | null {
   const address1 = parts.join(", ");
   return address1.length >= 5 && city.length >= 2 && province.length >= 2 && /^\d{6}$/.test(zip) ? { address1, city, province, zip, country: "India" } : null;
 }
-const normalizePhone = (value: string) => value.replace(/\D/g, "").slice(-10);
 const refundCategory = (text: string): SupportTicket["category"] => /missing|nahi aaya|rakhi nahi/i.test(text) ? "missing" : /refund|paisa wapas/i.test(text) ? "refund" : /return|wrong item|galat item/i.test(text) ? "return" : "other";
 const formatAddress = (address: ShopifyAddress) => [address.address1, address.address2, address.city, address.province, address.zip].filter(Boolean).join(", ");
 const formatMoney = (order: ShopifyOrder) => new Intl.NumberFormat("en-IN", { style: "currency", currency: order.currencyCode }).format(Number(order.totalAmount));
+const formatShopifyOrderSummary = (order: ShopifyOrder) => {
+  const items = order.lineItems.slice(0, 3).map((item) => `${item.title} ×${item.quantity}`).join(", ") || "Order items unavailable";
+  const extraItems = order.lineItems.length > 3 ? ` +${order.lineItems.length - 3} more` : "";
+  const date = new Date(order.createdAt).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  const statuses = [order.displayFinancialStatus, order.displayFulfillmentStatus].filter(Boolean).map((status) => humanStatus(String(status))).join(" / ");
+  const tracking = order.trackingInfo?.find((item) => item.number || item.url);
+  return `${date} · ${items}${extraItems} · ${formatMoney(order)}${statuses ? ` · ${statuses}` : ""}${tracking?.number ? ` · AWB ${tracking.number}` : ""}`;
+};
 const formatDate = (value: string) => new Date(value).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
 const statusEmoji = (status: string) => /delivered/i.test(status) ? "✅" : /out for delivery/i.test(status) ? "🎉" : /ndr|fail/i.test(status) ? "⚠️" : /rto|return/i.test(status) ? "↩️" : "🚚";
 const humanStatus = (status: string) => status.replace(/\b\w/g, (letter) => letter.toUpperCase());

@@ -135,6 +135,8 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
       const queryToken = typeof request.query.token === "string" ? request.query.token : undefined;
       const webhookToken = request.header("x-autoship-webhook-token") || queryToken;
       if (!whatsapp.verifySignature(rawBody, signature, webhookToken)) return response.status(401).json({ error: "Invalid webhook signature" });
+      const manualMessages = whatsapp.extractManualMessages(request.body);
+      await Promise.all(manualMessages.map((message) => whatsappRouter.handleManualAgentMessage(message)));
       const messages = whatsapp.extractMessages(request.body);
       await Promise.all(messages.map((message) => whatsappRouter.handleIncomingMessage(message)));
       response.sendStatus(200);
@@ -187,6 +189,15 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
       if (!(["open", "resolved"] as const).includes(status)) return response.status(400).json({ error: "Status must be open or resolved." });
       if (!(await store.updateSupportTicket(String(request.params.ticketId), status))) return response.status(404).json({ error: "Support ticket was not found." });
       response.json({ updated: true });
+    } catch (error) { next(error); }
+  });
+  app.patch("/api/support/bot-pauses/:phone", authenticate, adminOnly, async (request, response, next) => {
+    try {
+      const phone = String(request.params.phone || "").replace(/\D/g, "");
+      if (phone.length < 10 || phone.length > 15) return response.status(400).json({ error: "A valid WhatsApp phone number is required." });
+      if (typeof request.body?.paused !== "boolean") return response.status(400).json({ error: "paused must be true or false." });
+      await store.setBotPaused(phone, request.body.paused, "manual");
+      response.json({ phone, paused: request.body.paused });
     } catch (error) { next(error); }
   });
   app.get("/api/settings/status", authenticate, adminOnly, (_request, response) => response.json({ connected: !config.mockMode && Boolean(config.nimbusApiKey && config.nimbusApiSecret), demoMode: config.mockMode, apiUrl: config.nimbusApiUrl, database: "PostgreSQL", support: { whatsapp: whatsapp.connected, shopify: shopify.connected } }));
