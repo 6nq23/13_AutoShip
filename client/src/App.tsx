@@ -448,12 +448,15 @@ function SupportPage() {
   const [ticketFilter, setTicketFilter] = useState<"open" | "resolved" | "all">("open");
   const [selectedPhone, setSelectedPhone] = useState("");
   const [chatSearch, setChatSearch] = useState("");
+  const [chatFilter, setChatFilter] = useState<"all" | "attention" | "automated" | "human">("all");
   const [messageDraft, setMessageDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [controlPhone, setControlPhone] = useState("");
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
   const load = useCallback(async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
-    try { setOverview(await api.supportOverview()); setError(""); }
+    try { setOverview(await api.supportOverview()); setLastSyncedAt(new Date()); setError(""); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Support activity could not be loaded."); }
     finally { setLoading(false); }
   }, []);
@@ -479,7 +482,21 @@ function SupportPage() {
       return { phone, messages, lastMessage, lastActivity, unreadCount, conversation, pause, tickets };
     }).sort((left, right) => Date.parse(right.lastActivity) - Date.parse(left.lastActivity));
   }, [overview]);
-  const filteredChats = chats.filter((chat) => !chatSearch || chat.phone.includes(chatSearch.replace(/\D/g, "")) || formatPhone(chat.phone).toLowerCase().includes(chatSearch.toLowerCase()));
+  const filteredChats = chats.filter((chat) => {
+    const query = chatSearch.trim().toLowerCase();
+    const digits = query.replace(/\D/g, "");
+    const matchesSearch = !query
+      || (digits && chat.phone.includes(digits))
+      || formatPhone(chat.phone).toLowerCase().includes(query)
+      || chat.messages.some((message) => message.text.toLowerCase().includes(query) || message.orderNumber?.toLowerCase().includes(query))
+      || chat.tickets.some((ticket) => ticket.orderNumber?.toLowerCase().includes(query));
+    const needsAttention = Boolean(chat.pause || chat.unreadCount || chat.tickets.some((ticket) => ticket.status === "open"));
+    const matchesFilter = chatFilter === "all"
+      || (chatFilter === "attention" && needsAttention)
+      || (chatFilter === "human" && Boolean(chat.pause))
+      || (chatFilter === "automated" && !chat.pause);
+    return matchesSearch && matchesFilter;
+  });
   const selectedChat = chats.find((chat) => chat.phone === selectedPhone) || chats[0];
   useEffect(() => {
     if (chats.length && !chats.some((chat) => chat.phone === selectedPhone)) setSelectedPhone(chats[0].phone);
@@ -494,6 +511,8 @@ function SupportPage() {
   }
 
   async function setBotPaused(phone: string, paused: boolean) {
+    if (controlPhone) return;
+    setControlPhone(phone);
     try {
       await api.setBotPaused(phone, paused);
       setOverview((current) => {
@@ -504,6 +523,7 @@ function SupportPage() {
         return { ...current, botPauses, conversations: paused ? current.conversations.filter((item) => item.phone !== phone) : current.conversations };
       });
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Bot control could not be updated."); }
+    finally { setControlPhone(""); }
   }
 
   async function sendAgentReply(event: React.FormEvent) {
@@ -524,7 +544,7 @@ function SupportPage() {
   const tickets = overview.tickets.filter((ticket) => ticketFilter === "all" || ticket.status === ticketFilter);
   const connectionEntries = Object.entries(overview.connections) as Array<[keyof SupportOverview["connections"], boolean]>;
   return <>
-    <div className="page-heading support-heading"><div><p className="eyebrow">Customer care</p><h1>WhatsApp support</h1><p>Live conversations, automation health, and escalated tickets in one place.</p></div><button className="button secondary" onClick={() => void load(true)}><RefreshCw /> Refresh</button></div>
+    <div className="page-heading support-heading"><div><p className="eyebrow">Customer care</p><h1>WhatsApp support</h1><p>Live conversations, automation health, and escalated tickets in one place.</p></div><div className="support-sync"><span>{lastSyncedAt ? `Updated ${lastSyncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Connecting…"}</span><button className="button secondary" onClick={() => void load(true)}><RefreshCw /> Refresh</button></div></div>
     {error && <div className="alert error" role="alert"><AlertTriangle />{error}</div>}
     <div className="connection-strip" aria-label="Support connections">{connectionEntries.map(([name, connected]) => <span className={connected ? "connection connected" : "connection disconnected"} key={name}><i />{name} {connected ? "ready" : "needs setup"}</span>)}</div>
     <div className="metric-grid support-metrics">
@@ -535,17 +555,19 @@ function SupportPage() {
     </div>
     <section className="card whatsapp-inbox">
       <aside className="chat-sidebar">
-        <div className="chat-sidebar-head"><div><h2>Chats</h2><span>{chats.length} phone numbers</span></div><span className="count-pill">{chats.reduce((total, chat) => total + chat.unreadCount, 0)} unread</span></div>
-        <label className="chat-search"><Search /><input aria-label="Search chats by phone" placeholder="Search phone number" value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} /></label>
+        <div className="chat-sidebar-head"><div><h2>Conversations</h2><span>{chats.length} customer threads</span></div><span className="count-pill">{chats.filter((chat) => chat.pause || chat.tickets.some((ticket) => ticket.status === "open")).length} need attention</span></div>
+        <label className="chat-search"><Search /><input aria-label="Search chats" placeholder="Phone, order ID, or message" value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} /></label>
+        <div className="chat-filter-bar" aria-label="Filter conversations">{(["all", "attention", "automated", "human"] as const).map((filter) => <button className={chatFilter === filter ? "active" : ""} onClick={() => setChatFilter(filter)} key={filter}>{filter}</button>)}</div>
         <div className="chat-list">{filteredChats.length ? filteredChats.map((chat) => <button className={selectedChat?.phone === chat.phone ? "active" : ""} onClick={() => setSelectedPhone(chat.phone)} key={chat.phone}>
-          <span className="conversation-avatar">{chat.phone.slice(-2)}</span><span className="chat-list-copy"><strong>{formatPhone(chat.phone)}</strong><small>{chat.lastMessage?.text || (chat.conversation ? "Support flow is waiting" : "No messages yet")}</small></span>
+          <span className={`conversation-avatar ${chat.pause ? "human" : ""}`}>{chat.phone.slice(-2)}</span><span className="chat-list-copy"><strong>{formatPhone(chat.phone)}<em className={chat.pause ? "human" : "automated"}>{chat.pause ? "Human" : "AI"}</em></strong><small>{chat.lastMessage?.text || (chat.conversation ? "Support flow is waiting" : "No messages yet")}</small></span>
           <span className="chat-list-meta"><time>{new Date(chat.lastActivity).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>{chat.unreadCount > 0 && <b>{chat.unreadCount}</b>}</span>
         </button>) : <SupportEmpty icon={<Inbox />} title="No matching chats" detail="Try another phone number." />}</div>
       </aside>
       <div className="chat-window">{selectedChat ? <>
-        <header className="chat-window-head"><div className="conversation-avatar">{selectedChat.phone.slice(-2)}</div><div><strong>{formatPhone(selectedChat.phone)}</strong><small>{selectedChat.pause ? "Human agent active · automation paused" : overview.connections.ai ? selectedChat.conversation ? `AI agent active · ${selectedChat.conversation.step.replace(/_/g, " ")}` : "AI agent active" : selectedChat.conversation ? `Bot active · ${selectedChat.conversation.step.replace(/_/g, " ")}` : "Bot active"}</small></div><button className={`button ${selectedChat.pause ? "secondary" : "danger"}`} onClick={() => void setBotPaused(selectedChat.phone, !selectedChat.pause)}>{selectedChat.pause ? "Resume automation" : "Pause automation"}</button></header>
-        <div className="chat-thread" aria-live="polite">{selectedChat.messages.length ? selectedChat.messages.map((message) => <article className={`chat-bubble ${message.direction}`} key={message.id}><p>{message.text}</p><footer><span>{message.direction === "inbound" ? "Customer" : message.source === "agent" ? "You" : message.aiProvider ? `AI · ${message.aiProvider}` : "AutoShip bot"}</span><time>{new Date(message.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>{message.direction === "outbound" && <Check aria-label="Read in AutoShip" />}</footer>{(message.intent || message.orderNumber) && <div>{message.intent && <span>{friendlyIntent(message.intent)}</span>}{message.orderNumber && <span>{message.orderNumber}</span>}</div>}</article>) : <SupportEmpty icon={<MessageCircle />} title="No messages in this chat" detail="Messages for this number will appear here." />}<div ref={threadEndRef} /></div>
-        <form className="chat-composer" onSubmit={sendAgentReply}><input maxLength={2_000} placeholder="Type a WhatsApp reply" value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} /><button className="button primary" disabled={sending || !messageDraft.trim()}>{sending ? <LoaderCircle className="spin" /> : <Send />}<span>Send</span></button></form>
+        <header className="chat-window-head"><div className={`conversation-avatar ${selectedChat.pause ? "human" : ""}`}>{selectedChat.phone.slice(-2)}</div><div><strong>{formatPhone(selectedChat.phone)}</strong><small>{selectedChat.pause ? "Human agent active · automation paused" : overview.connections.ai ? selectedChat.conversation ? `Gemini automation · ${selectedChat.conversation.step.replace(/_/g, " ")}` : "Gemini automation ready" : selectedChat.conversation ? `Rules bot · ${selectedChat.conversation.step.replace(/_/g, " ")}` : "Rules bot ready"}</small><span className="chat-context">{selectedChat.messages.length} messages · {selectedChat.tickets.filter((ticket) => ticket.status === "open").length} open tickets</span></div><div className="chat-head-actions"><a className="button secondary" href={`https://wa.me/${selectedChat.phone}`} target="_blank" rel="noreferrer">Open WhatsApp</a><button className={`button ${selectedChat.pause ? "secondary" : "danger"}`} disabled={controlPhone === selectedChat.phone} onClick={() => void setBotPaused(selectedChat.phone, !selectedChat.pause)}>{controlPhone === selectedChat.phone ? <LoaderCircle className="spin" /> : selectedChat.pause ? "Resume AI" : "Take over"}</button></div></header>
+        <div className="chat-thread" aria-live="polite">{selectedChat.messages.length ? selectedChat.messages.map((message) => <article className={`chat-bubble ${message.direction} ${message.source || "bot"}`} key={message.id}><p>{message.text}</p><footer><span>{message.direction === "inbound" ? "Customer" : message.source === "agent" ? "Human agent" : message.aiProvider ? `AI · ${message.aiProvider}` : "Automation"}</span><time>{new Date(message.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>{message.direction === "outbound" && <Check aria-label="Sent from AutoShip" />}</footer>{(message.intent || message.orderNumber) && <div>{message.intent && <span>{friendlyIntent(message.intent)}</span>}{message.orderNumber && <span>{message.orderNumber}</span>}</div>}</article>) : <SupportEmpty icon={<MessageCircle />} title="No messages in this chat" detail="Messages for this number will appear here." />}<div ref={threadEndRef} /></div>
+        <div className="quick-replies"><span>Quick replies</span>{["We’re checking this now.", "Please share your order ID or phone number.", "Your request is with our senior support team. Please wait for an update."].map((reply) => <button type="button" onClick={() => setMessageDraft(reply)} key={reply}>{reply}</button>)}</div>
+        <form className="chat-composer" onSubmit={sendAgentReply}><textarea rows={1} maxLength={2_000} aria-label="WhatsApp reply" placeholder="Type a WhatsApp reply…" value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} /><div className="composer-meta"><span>{messageDraft.length}/2000</span><button className="button primary" disabled={sending || !messageDraft.trim()}>{sending ? <LoaderCircle className="spin" /> : <Send />}<span>Send</span></button></div></form>
       </> : <SupportEmpty icon={<MessageCircle />} title="No WhatsApp chats yet" detail="Each customer phone number will appear as one conversation." />}</div>
     </section>
     <section className="card support-panel ticket-panel conversation-panel"><div className="support-panel-title"><div><TicketCheck /><span><h2>Escalated tickets</h2><p>Refund, return, missing-item, and recovery work</p></span></div></div><div className="ticket-filters" aria-label="Ticket filter">{(["open", "resolved", "all"] as const).map((filter) => <button className={ticketFilter === filter ? "active" : ""} onClick={() => setTicketFilter(filter)} key={filter}>{filter}</button>)}</div>{tickets.length ? <div className="ticket-list">{tickets.map((ticket) => <article className="support-ticket" key={ticket.ticketId}><header><span className={`ticket-status ${ticket.status}`}>{ticket.status}</span><time>{new Date(ticket.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></header><strong>{ticket.orderNumber || "Order not identified"}</strong><p>{ticket.description || friendlyIntent("refund_return")}</p><div><span>{formatPhone(ticket.phone)}</span><span>{ticket.category}</span></div><button className="button secondary" onClick={() => void setTicketStatus(ticket.ticketId, ticket.status === "open" ? "resolved" : "open")}>{ticket.status === "open" ? <><Check /> Mark resolved</> : <><RefreshCw /> Reopen</>}</button></article>)}</div> : <SupportEmpty icon={<TicketCheck />} title={`No ${ticketFilter === "all" ? "" : `${ticketFilter} `}tickets`} detail="Escalations created by the bot will appear here." />}</section>
