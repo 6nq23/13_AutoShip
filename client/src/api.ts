@@ -22,6 +22,7 @@ const configuredApiUrl = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "")
 // separately deployed Vercel API, where the tunnel origin would fail CORS.
 const isQuickTunnel = typeof window !== "undefined" && window.location.hostname.endsWith(".trycloudflare.com");
 const API_BASE_URL = isQuickTunnel ? "" : configuredApiUrl;
+class ApiRequestError extends Error { constructor(message: string, readonly status: number, readonly body: Record<string, any>) { super(message); } }
 export const getToken = () => localStorage.getItem(TOKEN_KEY);
 export const setToken = (token: string) => localStorage.setItem(TOKEN_KEY, token);
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
@@ -35,7 +36,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   try { response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers }); }
   catch { throw new Error(`The AutoShip backend is unavailable at ${API_BASE_URL || window.location.origin}. Check the deployment and try again.`); }
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(`${body.error || "The backend request failed."}${body.code ? ` (${body.code})` : ""}`);
+  if (!response.ok) throw new ApiRequestError(`${body.error || "The backend request failed."}${body.code ? ` (${body.code})` : ""}`, response.status, body);
   return body;
 }
 
@@ -44,7 +45,7 @@ export const api = {
   register: (username: string, password: string) => request<{ token: string; user: User; demoMode: boolean }>("/api/auth/register", { method: "POST", body: JSON.stringify({ username, password }) }),
   me: () => request<{ user: User; demoMode: boolean }>("/api/auth/me"),
   ship: (orderNumbers: string[]) => request<ShipResult>("/api/ship-bulk", { method: "POST", body: JSON.stringify({ orderNumbers }) }),
-  startShipping: (orderNumbers: string[]) => request<{ job: ShippingJob }>("/api/shipping-jobs", { method: "POST", body: JSON.stringify({ orderNumbers }) }),
+  startShipping: async (orderNumbers: string[]) => { try { return await request<{ job: ShippingJob }>("/api/shipping-jobs", { method: "POST", body: JSON.stringify({ orderNumbers }) }); } catch (error) { if (error instanceof ApiRequestError && error.status === 409 && error.body.job) return { job: error.body.job as ShippingJob }; throw error; } },
   shippingJob: (jobId: string) => request<{ job: ShippingJob }>(`/api/shipping-jobs/${encodeURIComponent(jobId)}`),
   activeShippingJob: () => request<{ job: ShippingJob | null }>("/api/shipping-jobs/active"),
   history: () => request<{ batches: HistoryItem[] }>("/api/history"),
