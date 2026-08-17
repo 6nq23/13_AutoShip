@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { IScannerControls } from "@zxing/browser";
-import { AlertTriangle, BarChart3, Box, CalendarDays, Camera, Check, ChevronRight, CircleUserRound, Clock3, Database, Download, Filter, History, Inbox, Keyboard, LoaderCircle, LogOut, MessageCircle, PackageCheck, Plus, RefreshCw, ScanLine, Search, Settings, ShieldCheck, TicketCheck, Trash2, Truck, Users } from "lucide-react";
-import { api, clearToken, getToken, HistoryItem, normalizeOrder, setToken, ShipResult, ShippingJob, ShippingLog, SupportOverview, User } from "./api";
+import { AlertTriangle, BarChart3, Box, CalendarDays, Camera, Check, ChevronRight, CircleUserRound, Clock3, Database, Download, Filter, History, Inbox, Keyboard, LoaderCircle, LogOut, MessageCircle, PackageCheck, Plus, RefreshCw, ScanLine, Search, Send, Settings, ShieldCheck, TicketCheck, Trash2, Truck, Users } from "lucide-react";
+import { api, AiStatus, clearToken, getToken, HistoryItem, normalizeOrder, setToken, ShipResult, ShippingJob, ShippingLog, SupportOverview, User } from "./api";
 
 type Tab = "scan" | "history" | "analytics" | "support" | "settings";
 
@@ -432,6 +432,11 @@ function SupportPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [ticketFilter, setTicketFilter] = useState<"open" | "resolved" | "all">("open");
+  const [selectedPhone, setSelectedPhone] = useState("");
+  const [chatSearch, setChatSearch] = useState("");
+  const [messageDraft, setMessageDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const threadEndRef = useRef<HTMLDivElement | null>(null);
   const load = useCallback(async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
     try { setOverview(await api.supportOverview()); setError(""); }
@@ -439,6 +444,33 @@ function SupportPage() {
     finally { setLoading(false); }
   }, []);
   useEffect(() => { void load(true); const timer = window.setInterval(() => void load(), 5_000); return () => window.clearInterval(timer); }, [load]);
+
+  const chats = useMemo(() => {
+    if (!overview) return [];
+    const phones = new Set([
+      ...overview.messages.map((message) => message.phone),
+      ...overview.conversations.map((conversation) => conversation.phone),
+      ...overview.botPauses.map((pause) => pause.phone),
+      ...overview.tickets.map((ticket) => ticket.phone),
+    ]);
+    return [...phones].map((phone) => {
+      const messages = overview.messages.filter((message) => message.phone === phone).sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+      const lastMessage = messages.at(-1);
+      const lastOutboundAt = Math.max(0, ...messages.filter((message) => message.direction === "outbound").map((message) => Date.parse(message.createdAt)));
+      const unreadCount = messages.filter((message) => message.direction === "inbound" && Date.parse(message.createdAt) > lastOutboundAt).length;
+      const conversation = overview.conversations.find((item) => item.phone === phone);
+      const pause = overview.botPauses.find((item) => item.phone === phone);
+      const tickets = overview.tickets.filter((ticket) => ticket.phone === phone);
+      const lastActivity = lastMessage?.createdAt || conversation?.updatedAt || pause?.pausedAt || tickets[0]?.createdAt || new Date(0).toISOString();
+      return { phone, messages, lastMessage, lastActivity, unreadCount, conversation, pause, tickets };
+    }).sort((left, right) => Date.parse(right.lastActivity) - Date.parse(left.lastActivity));
+  }, [overview]);
+  const filteredChats = chats.filter((chat) => !chatSearch || chat.phone.includes(chatSearch.replace(/\D/g, "")) || formatPhone(chat.phone).toLowerCase().includes(chatSearch.toLowerCase()));
+  const selectedChat = chats.find((chat) => chat.phone === selectedPhone) || chats[0];
+  useEffect(() => {
+    if (chats.length && !chats.some((chat) => chat.phone === selectedPhone)) setSelectedPhone(chats[0].phone);
+  }, [chats, selectedPhone]);
+  useEffect(() => { threadEndRef.current?.scrollIntoView({ block: "end" }); }, [selectedChat?.messages.length, selectedChat?.phone]);
 
   async function setTicketStatus(ticketId: string, status: "open" | "resolved") {
     try {
@@ -460,12 +492,23 @@ function SupportPage() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Bot control could not be updated."); }
   }
 
+  async function sendAgentReply(event: React.FormEvent) {
+    event.preventDefault();
+    const text = messageDraft.trim();
+    if (!selectedChat || !text || sending) return;
+    setSending(true); setError("");
+    try {
+      await api.sendSupportMessage(selectedChat.phone, text);
+      setMessageDraft("");
+      await load();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "The WhatsApp message could not be sent."); }
+    finally { setSending(false); }
+  }
+
   if (loading) return <div className="analytics-loading"><LoaderCircle className="spin" /><span>Loading WhatsApp support activity...</span></div>;
   if (!overview) return <div className="alert error"><AlertTriangle />{error || "Support data is unavailable."}</div>;
   const tickets = overview.tickets.filter((ticket) => ticketFilter === "all" || ticket.status === ticketFilter);
   const connectionEntries = Object.entries(overview.connections) as Array<[keyof SupportOverview["connections"], boolean]>;
-  const recentPhones = [...new Set(overview.messages.filter((message) => message.direction === "inbound").map((message) => message.phone))].slice(0, 20);
-  const pausedPhones = new Set(overview.botPauses.map((item) => item.phone));
   return <>
     <div className="page-heading support-heading"><div><p className="eyebrow">Customer care</p><h1>WhatsApp support</h1><p>Live conversations, automation health, and escalated tickets in one place.</p></div><button className="button secondary" onClick={() => void load(true)}><RefreshCw /> Refresh</button></div>
     {error && <div className="alert error" role="alert"><AlertTriangle />{error}</div>}
@@ -476,18 +519,32 @@ function SupportPage() {
       <article className="card metric-card"><span>Active flows</span><strong>{overview.stats.activeConversations}</strong><small>Conversations awaiting input</small></article>
       <article className="card metric-card failed"><span>Open tickets</span><strong>{overview.stats.openTickets}</strong><small>Human follow-up required</small></article>
     </div>
-    <div className="support-grid">
-      <section className="card support-panel message-panel"><div className="support-panel-title"><div><MessageCircle /><span><h2>Live message feed</h2><p>Newest first · refreshes every 5 seconds</p></span></div><span className="count-pill">{overview.messages.length}</span></div>{overview.messages.length ? <div className="message-feed" aria-live="polite">{overview.messages.map((message) => <article className={`support-message ${message.direction}`} key={message.id}><div><strong>{message.direction === "inbound" ? formatPhone(message.phone) : message.source === "agent" ? "Human agent" : "AutoShip bot"}</strong><time>{new Date(message.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></div><p>{message.text}</p><footer>{message.intent && <span>{friendlyIntent(message.intent)}</span>}{message.orderNumber && <span>{message.orderNumber}</span>}</footer></article>)}</div> : <SupportEmpty icon={<Inbox />} title="No WhatsApp messages yet" detail="Incoming webhook messages and bot replies will appear here." />}</section>
-      <section className="card support-panel ticket-panel"><div className="support-panel-title"><div><TicketCheck /><span><h2>Escalated tickets</h2><p>Refund, return, missing-item, and recovery work</p></span></div></div><div className="ticket-filters" aria-label="Ticket filter">{(["open", "resolved", "all"] as const).map((filter) => <button className={ticketFilter === filter ? "active" : ""} onClick={() => setTicketFilter(filter)} key={filter}>{filter}</button>)}</div>{tickets.length ? <div className="ticket-list">{tickets.map((ticket) => <article className="support-ticket" key={ticket.ticketId}><header><span className={`ticket-status ${ticket.status}`}>{ticket.status}</span><time>{new Date(ticket.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></header><strong>{ticket.orderNumber || "Order not identified"}</strong><p>{ticket.description || friendlyIntent("refund_return")}</p><div><span>{formatPhone(ticket.phone)}</span><span>{ticket.category}</span></div><button className="button secondary" onClick={() => void setTicketStatus(ticket.ticketId, ticket.status === "open" ? "resolved" : "open")}>{ticket.status === "open" ? <><Check /> Mark resolved</> : <><RefreshCw /> Reopen</>}</button></article>)}</div> : <SupportEmpty icon={<TicketCheck />} title={`No ${ticketFilter === "all" ? "" : `${ticketFilter} `}tickets`} detail="Escalations created by the bot will appear here." />}</section>
-    </div>
-    <section className="card support-panel conversation-panel"><div className="support-panel-title"><div><MessageCircle /><span><h2>Human takeover</h2><p>Pause AutoShip while you reply manually. Pauses expire after 24 hours unless resumed sooner.</p></span></div><span className="count-pill">{overview.botPauses.length} paused</span></div>{recentPhones.length ? <div className="conversation-list">{recentPhones.map((phone) => { const paused = pausedPhones.has(phone); return <article key={phone}><span className="conversation-avatar">{phone.slice(-2)}</span><div><strong>{formatPhone(phone)}</strong><small>{paused ? "Human agent controls this chat" : "AutoShip is active"}</small></div><span>{paused ? "bot paused" : "bot active"}</span><button className={`button ${paused ? "secondary" : "danger"}`} onClick={() => void setBotPaused(phone, !paused)}>{paused ? "Resume bot" : "Pause bot"}</button></article>; })}</div> : <SupportEmpty icon={<Users />} title="No recent customers" detail="Customer conversations will appear here." />}</section>
-    <section className="card support-panel conversation-panel"><div className="support-panel-title"><div><Users /><span><h2>Active conversation states</h2><p>Flows waiting for a customer reply; each expires after 24 hours.</p></span></div><span className="count-pill">{overview.conversations.length}</span></div>{overview.conversations.length ? <div className="conversation-list">{overview.conversations.map((conversation) => <article key={conversation.phone}><span className="conversation-avatar">{conversation.phone.slice(-2)}</span><div><strong>{formatPhone(conversation.phone)}</strong><small>{conversation.intent ? friendlyIntent(conversation.intent) : "Choosing a support topic"}</small></div><span>{conversation.step.replace(/_/g, " ")}</span><time>expires {new Date(conversation.expiresAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></article>)}</div> : <SupportEmpty icon={<Users />} title="No active conversations" detail="All current customer flows are complete or expired." />}</section>
+    <section className="card whatsapp-inbox">
+      <aside className="chat-sidebar">
+        <div className="chat-sidebar-head"><div><h2>Chats</h2><span>{chats.length} phone numbers</span></div><span className="count-pill">{chats.reduce((total, chat) => total + chat.unreadCount, 0)} unread</span></div>
+        <label className="chat-search"><Search /><input aria-label="Search chats by phone" placeholder="Search phone number" value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} /></label>
+        <div className="chat-list">{filteredChats.length ? filteredChats.map((chat) => <button className={selectedChat?.phone === chat.phone ? "active" : ""} onClick={() => setSelectedPhone(chat.phone)} key={chat.phone}>
+          <span className="conversation-avatar">{chat.phone.slice(-2)}</span><span className="chat-list-copy"><strong>{formatPhone(chat.phone)}</strong><small>{chat.lastMessage?.text || (chat.conversation ? "Support flow is waiting" : "No messages yet")}</small></span>
+          <span className="chat-list-meta"><time>{new Date(chat.lastActivity).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>{chat.unreadCount > 0 && <b>{chat.unreadCount}</b>}</span>
+        </button>) : <SupportEmpty icon={<Inbox />} title="No matching chats" detail="Try another phone number." />}</div>
+      </aside>
+      <div className="chat-window">{selectedChat ? <>
+        <header className="chat-window-head"><div className="conversation-avatar">{selectedChat.phone.slice(-2)}</div><div><strong>{formatPhone(selectedChat.phone)}</strong><small>{selectedChat.pause ? "Human agent active · automation paused" : overview.connections.ai ? selectedChat.conversation ? `AI agent active · ${selectedChat.conversation.step.replace(/_/g, " ")}` : "AI agent active" : selectedChat.conversation ? `Bot active · ${selectedChat.conversation.step.replace(/_/g, " ")}` : "Bot active"}</small></div><button className={`button ${selectedChat.pause ? "secondary" : "danger"}`} onClick={() => void setBotPaused(selectedChat.phone, !selectedChat.pause)}>{selectedChat.pause ? "Resume automation" : "Pause automation"}</button></header>
+        <div className="chat-thread" aria-live="polite">{selectedChat.messages.length ? selectedChat.messages.map((message) => <article className={`chat-bubble ${message.direction}`} key={message.id}><p>{message.text}</p><footer><span>{message.direction === "inbound" ? "Customer" : message.source === "agent" ? "You" : message.aiProvider ? `AI · ${message.aiProvider}` : "AutoShip bot"}</span><time>{new Date(message.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>{message.direction === "outbound" && <Check aria-label="Read in AutoShip" />}</footer>{(message.intent || message.orderNumber) && <div>{message.intent && <span>{friendlyIntent(message.intent)}</span>}{message.orderNumber && <span>{message.orderNumber}</span>}</div>}</article>) : <SupportEmpty icon={<MessageCircle />} title="No messages in this chat" detail="Messages for this number will appear here." />}<div ref={threadEndRef} /></div>
+        <form className="chat-composer" onSubmit={sendAgentReply}><input maxLength={2_000} placeholder="Type a WhatsApp reply" value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} /><button className="button primary" disabled={sending || !messageDraft.trim()}>{sending ? <LoaderCircle className="spin" /> : <Send />}<span>Send</span></button></form>
+      </> : <SupportEmpty icon={<MessageCircle />} title="No WhatsApp chats yet" detail="Each customer phone number will appear as one conversation." />}</div>
+    </section>
+    <section className="card support-panel ticket-panel conversation-panel"><div className="support-panel-title"><div><TicketCheck /><span><h2>Escalated tickets</h2><p>Refund, return, missing-item, and recovery work</p></span></div></div><div className="ticket-filters" aria-label="Ticket filter">{(["open", "resolved", "all"] as const).map((filter) => <button className={ticketFilter === filter ? "active" : ""} onClick={() => setTicketFilter(filter)} key={filter}>{filter}</button>)}</div>{tickets.length ? <div className="ticket-list">{tickets.map((ticket) => <article className="support-ticket" key={ticket.ticketId}><header><span className={`ticket-status ${ticket.status}`}>{ticket.status}</span><time>{new Date(ticket.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></header><strong>{ticket.orderNumber || "Order not identified"}</strong><p>{ticket.description || friendlyIntent("refund_return")}</p><div><span>{formatPhone(ticket.phone)}</span><span>{ticket.category}</span></div><button className="button secondary" onClick={() => void setTicketStatus(ticket.ticketId, ticket.status === "open" ? "resolved" : "open")}>{ticket.status === "open" ? <><Check /> Mark resolved</> : <><RefreshCw /> Reopen</>}</button></article>)}</div> : <SupportEmpty icon={<TicketCheck />} title={`No ${ticketFilter === "all" ? "" : `${ticketFilter} `}tickets`} detail="Escalations created by the bot will appear here." />}</section>
   </>;
 }
 
 function SupportEmpty({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) { return <div className="support-empty">{icon}<strong>{title}</strong><span>{detail}</span></div>; }
 const friendlyIntent = (intent: string) => ({ confirm_order: "Order confirmation", change_address: "Address / phone change", order_status: "Order tracking", not_dispatched: "Dispatch delay", order_failed: "Failed delivery", refund_return: "Refund / return / missing" } as Record<string, string>)[intent] || intent.replace(/_/g, " ");
-const formatPhone = (phone: string) => phone.length === 10 ? `+91 ${phone.slice(0, 5)} ${phone.slice(5)}` : `+${phone}`;
+const formatPhone = (phone: string) => {
+  const digits = phone.replace(/\D/g, "");
+  const local = digits.length === 12 && digits.startsWith("91") ? digits.slice(2) : digits;
+  return local.length === 10 ? `+91 ${local.slice(0, 5)} ${local.slice(5)}` : `+${digits}`;
+};
 
 function HistoryPage() {
   const [items, setItems] = useState<HistoryItem[]>([]); const [loading, setLoading] = useState(true);
@@ -497,8 +554,9 @@ function HistoryPage() {
 
 function SettingsPage() {
   const [status, setStatus] = useState<{ connected: boolean; demoMode: boolean; apiUrl: string; database: string } | null>(null);
-  useEffect(() => { api.status().then(setStatus); }, []);
-  return <><div className="page-heading"><div><p className="eyebrow">Workspace</p><h1>Settings</h1><p>Connection and account readiness.</p></div></div><div className="settings-grid"><section className="card setting-card"><div className="setting-icon"><ShieldCheck /></div><div><h2>NimbusPost connection</h2><p>{status?.demoMode ? "Demo data is active. Add your API key pair to ship real orders." : status?.connected ? "Connected and ready for live shipping." : "Checking connection…"}</p><span className={`status-pill ${status?.connected ? "connected" : "demo"}`}>{status?.connected ? "Live" : "Demo mode"}</span></div></section><section className="card setting-card"><div className="setting-icon"><Database /></div><div><h2>Database</h2><p>Users, order lookups, and shipping batches are stored persistently in PostgreSQL.</p><span className="status-pill connected">{status?.database || "Checking…"}</span></div></section><section className="card setting-card"><div className="setting-icon"><CircleUserRound /></div><div><h2>Team access</h2><p>All signed-in users can scan, ship, and view shipment history. Only admins can open connection settings.</p><span className="status-pill">Role-based access</span></div></section></div></>;
+  const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
+  useEffect(() => { void api.status().then(setStatus).catch(() => undefined); void api.aiStatus().then(setAiStatus).catch(() => undefined); }, []);
+  return <><div className="page-heading"><div><p className="eyebrow">Workspace</p><h1>Settings</h1><p>Connection and account readiness.</p></div></div><div className="settings-grid"><section className="card setting-card"><div className="setting-icon"><ShieldCheck /></div><div><h2>NimbusPost connection</h2><p>{status?.demoMode ? "Demo data is active. Add your API key pair to ship real orders." : status?.connected ? "Connected and ready for live shipping." : "Checking connection…"}</p><span className={`status-pill ${status?.connected ? "connected" : "demo"}`}>{status?.connected ? "Live" : "Demo mode"}</span></div></section><section className="card setting-card"><div className="setting-icon"><MessageCircle /></div><div><h2>AI support agent</h2><p>{aiStatus?.enabled ? `${aiStatus.configuredProviders.join(", ")} configured. ${aiStatus.primaryProvider} is primary; escalation after ${aiStatus.maxTurns} unresolved turns${aiStatus.escalationPhone ? ` to ${formatPhone(aiStatus.escalationPhone)}` : ""}.` : "No AI key is configured. The existing deterministic support bot remains active."}</p><span className={`status-pill ${aiStatus?.enabled ? "connected" : "demo"}`}>{aiStatus?.enabled ? `Active · ${aiStatus.primaryProvider}` : "Fallback bot"}</span></div></section><section className="card setting-card"><div className="setting-icon"><Database /></div><div><h2>Database</h2><p>Users, order lookups, and shipping batches are stored persistently in PostgreSQL.</p><span className="status-pill connected">{status?.database || "Checking…"}</span></div></section><section className="card setting-card"><div className="setting-icon"><CircleUserRound /></div><div><h2>Team access</h2><p>All signed-in users can scan, ship, and view shipment history. Only admins can open connection settings.</p><span className="status-pill">Role-based access</span></div></section></div></>;
 }
 
 export default App;
