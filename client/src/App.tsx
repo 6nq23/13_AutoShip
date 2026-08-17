@@ -233,14 +233,10 @@ function downloadLogs(logs: ShippingLog[], jobId: string) {
 }
 
 function LabelDownloadButton({ labelUrl, label = "All successful labels", compact = false, secondary = false }: { labelUrl: string; label?: string; compact?: boolean; secondary?: boolean }) {
-  function openInNewPage() {
-    const absoluteUrl = new URL(labelUrl, window.location.origin).href;
-    const labelPage = window.open(absoluteUrl, `autoship-label-${Date.now()}`);
-    if (labelPage) labelPage.opener = null;
-  }
+  const absoluteUrl = new URL(labelUrl, window.location.origin).href;
   return compact
-    ? <button type="button" onClick={openInNewPage} aria-label={`${label} — open in a new page`} title={`${label} — open in a new page`}><Download /></button>
-    : <button type="button" className={`button ${secondary ? "secondary" : "primary"}`} onClick={openInNewPage}><Download /> {label}</button>;
+    ? <a href={absoluteUrl} target="autoship-label-page" rel="noopener noreferrer" aria-label={`${label} — open in a new page`} title={`${label} — open in a new page`}><Download /></a>
+    : <a className={`button ${secondary ? "secondary" : "primary"}`} href={absoluteUrl} target="autoship-label-page" rel="noopener noreferrer"><Download /> {label}</a>;
 }
 
 function PickupLabelButton({ batchId, labelUrl, compact = false }: { batchId: string; labelUrl?: string | null; compact?: boolean }) {
@@ -249,13 +245,15 @@ function PickupLabelButton({ batchId, labelUrl, compact = false }: { batchId: st
   const [error, setError] = useState("");
   async function generate() {
     const labelWindow = window.open("about:blank", `autoship-pickup-label-${Date.now()}`);
-    if (!labelWindow) { setError("Allow pop-ups for AutoShip, then try again."); return; }
-    labelWindow.opener = null; setLoading(true); setError("");
+    if (labelWindow) labelWindow.opener = null;
+    setLoading(true); setError("");
     try {
       const result = await api.historyLabel(batchId, "pickup_scheduled");
-      setGeneratedUrl(result.labelUrl); labelWindow.location.replace(result.labelUrl);
+      setGeneratedUrl(result.labelUrl);
+      if (labelWindow) labelWindow.location.replace(result.labelUrl);
+      else setError("Pickup labels are ready. Tap the label button once more to open them.");
     } catch (cause) {
-      labelWindow.close(); setError(cause instanceof Error ? cause.message : "Pickup-scheduled labels could not be generated.");
+      labelWindow?.close(); setError(cause instanceof Error ? cause.message : "Pickup-scheduled labels could not be generated.");
     } finally { setLoading(false); }
   }
   if (generatedUrl) return <LabelDownloadButton labelUrl={generatedUrl} label="Pickup scheduled labels" compact={compact} secondary />;
