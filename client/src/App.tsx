@@ -133,7 +133,7 @@ function ShipWorkspace() {
     if (!normalized) return setNotice({ kind: "error", text: "That isn’t a valid RBD order number." });
     if (orders.includes(normalized)) return setNotice({ kind: "error", text: `${normalized} is already in this batch.` });
     if (job && ["completed", "failed"].includes(job.status)) { setJob(null); localStorage.removeItem("autoship_shipping_job"); }
-    setOrders((current) => [normalized, ...current]); setInput(""); setNotice({ kind: "ok", text: `${normalized} added to the batch.` });
+    setOrders((current) => [...current, normalized]); setInput(""); setNotice({ kind: "ok", text: `${normalized} added to the batch.` });
     navigator.vibrate?.(50);
   }, [job, orders, shipping]);
 
@@ -232,20 +232,31 @@ function downloadLogs(logs: ShippingLog[], jobId: string) {
   downloadFile(`autoship-log-${jobId}.txt`, lines.join("\n"), "text/plain;charset=utf-8");
 }
 
-function LabelDownloadButton({ batchId, compact = false }: { batchId: string; compact?: boolean }) {
+function LabelDownloadButton({ labelUrl, label = "All successful labels", compact = false, secondary = false }: { labelUrl: string; label?: string; compact?: boolean; secondary?: boolean }) {
+  return compact
+    ? <a href={labelUrl} target="_blank" rel="noopener noreferrer" aria-label={`${label} — open in a new page`} title={`${label} — open in a new page`}><Download /></a>
+    : <a className={`button ${secondary ? "secondary" : "primary"}`} href={labelUrl} target="_blank" rel="noopener noreferrer"><Download /> {label}</a>;
+}
+
+function PickupLabelButton({ batchId, labelUrl, compact = false }: { batchId: string; labelUrl?: string | null; compact?: boolean }) {
+  const [generatedUrl, setGeneratedUrl] = useState(labelUrl || "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  async function openFreshLabel() {
+  async function generate() {
     const labelWindow = window.open("", "_blank");
-    setLoading(true); setError("");
+    if (!labelWindow) { setError("Allow pop-ups for AutoShip, then try again."); return; }
+    labelWindow.opener = null; setLoading(true); setError("");
     try {
-      const { labelUrl } = await api.historyLabel(batchId);
-      if (labelWindow) labelWindow.location.replace(labelUrl); else window.location.assign(labelUrl);
+      const result = await api.historyLabel(batchId, "pickup_scheduled");
+      setGeneratedUrl(result.labelUrl); labelWindow.location.replace(result.labelUrl);
     } catch (cause) {
-      labelWindow?.close(); setError(cause instanceof Error ? cause.message : "The label could not be generated.");
+      labelWindow.close(); setError(cause instanceof Error ? cause.message : "Pickup-scheduled labels could not be generated.");
     } finally { setLoading(false); }
   }
-  return <>{compact ? <button onClick={openFreshLabel} disabled={loading} aria-label="Download fresh labels" title={error || "Generate and download fresh labels"}>{loading ? <LoaderCircle className="spin" /> : <Download />}</button> : <button className="button primary" onClick={openFreshLabel} disabled={loading}>{loading ? <LoaderCircle className="spin" /> : <Download />} {loading ? "Generating labels…" : "Download labels"}</button>}{error && !compact && <span className="label-download-error" role="alert">{error}</span>}</>;
+  if (generatedUrl) return <LabelDownloadButton labelUrl={generatedUrl} label="Pickup scheduled labels" compact={compact} secondary />;
+  return compact
+    ? <button onClick={generate} disabled={loading} aria-label="Generate pickup scheduled labels in a new page" title={error || "Generate pickup scheduled labels in a new page"}>{loading ? <LoaderCircle className="spin" /> : <Download />}</button>
+    : <span className="pickup-label-action"><button className="button secondary" onClick={generate} disabled={loading}>{loading ? <LoaderCircle className="spin" /> : <Download />} {loading ? "Generating pickup labels…" : "Generate pickup labels"}</button>{error && <small role="alert">{error}</small>}</span>;
 }
 
 function JobProgress({ job }: { job: ShippingJob }) {
@@ -264,7 +275,7 @@ function JobProgress({ job }: { job: ShippingJob }) {
 
 function Results({ result, logs, onRetry }: { result: ShipResult; logs: ShippingLog[]; onRetry: () => void }) {
   const warningCount = result.shipped.filter((item) => item.warning).length;
-  return <section className="results-section"><div className="page-heading compact"><div><p className="eyebrow">Batch result</p><h2>{result.totalFailed ? "Partially shipped" : warningCount ? "Shipped with warning" : "All done"}</h2></div><div className="result-actions">{result.totalShipped > 0 && <LabelDownloadButton batchId={result.batchId} />}{result.failed.length > 0 && <button className="button error-download" onClick={() => downloadFailureReport(result)}><Download /> Download errors</button>}<button className="button secondary" onClick={() => downloadLogs(logs, result.batchId)}><Download /> Download logs</button></div></div><div className="results-grid"><div className="card result-card success-card"><div className="result-title"><span><Check /></span><div><strong>{result.totalShipped} shipped</strong><small>{warningCount ? `${warningCount} recovered from pickup scheduled · ready for labels` : "Ready for labels"}</small></div></div>{result.shipped.map((item) => <div className="result-order" key={item.orderNumber}><div className="result-row"><div><strong>{item.orderNumber}</strong><small>{item.awb || "AWB available in NimbusPost"}</small></div><div><span>{item.courier}</span><small>₹{item.cost.toFixed(2)}{item.alreadyBooked ? " · already booked" : ""}</small></div></div>{item.warning && <div className="recovered-warning" role="alert"><AlertTriangle /><div><strong>{item.warningCode || "SHIPMENT_WARNING"}</strong><span>{item.warning}</span><small>This order remains successful and its label is available above.</small></div></div>}</div>)}</div><div className="card result-card failure-card"><div className="result-title"><span><AlertTriangle /></span><div><strong>{result.totalFailed} need attention</strong><small>Fix and try again</small></div></div>{result.failed.length ? result.failed.map((item) => <div className="result-row" key={item.orderNumber}><div><strong>{item.orderNumber}</strong><small>{item.code}</small></div><span>{item.error}</span></div>) : <div className="mini-empty">No failures in this batch.</div>}{result.failed.length > 0 && <button className="button secondary wide" onClick={onRetry}><RefreshCw /> Retry failed</button>}</div></div></section>;
+  return <section className="results-section"><div className="page-heading compact"><div><p className="eyebrow">Batch result</p><h2>{result.totalFailed ? "Partially shipped" : warningCount ? "Shipped with warning" : "All done"}</h2></div><div className="result-actions">{result.labelUrl && <LabelDownloadButton labelUrl={result.labelUrl} />}{warningCount > 0 && <PickupLabelButton batchId={result.batchId} labelUrl={result.pickupScheduledLabelUrl} />}{result.failed.length > 0 && <button className="button error-download" onClick={() => downloadFailureReport(result)}><Download /> Download errors</button>}<button className="button secondary" onClick={() => downloadLogs(logs, result.batchId)}><Download /> Download logs</button></div></div><div className="results-grid"><div className="card result-card success-card"><div className="result-title"><span><Check /></span><div><strong>{result.totalShipped} shipped</strong><small>{warningCount ? `${warningCount} recovered from pickup scheduled · ready for labels` : "Ready for labels"}</small></div></div>{result.shipped.map((item) => <div className="result-order" key={item.orderNumber}><div className="result-row"><div><strong>{item.orderNumber}</strong><small>{item.awb || "AWB available in NimbusPost"}</small></div><div><span>{item.courier}</span><small>₹{item.cost.toFixed(2)}{item.alreadyBooked ? " · already booked" : ""}</small></div></div>{item.warning && <div className="recovered-warning" role="alert"><AlertTriangle /><div><strong>{item.warningCode || "SHIPMENT_WARNING"}</strong><span>{item.warning}</span><small>This order remains successful and has a separate pickup-scheduled label button above.</small></div></div>}</div>)}</div><div className="card result-card failure-card"><div className="result-title"><span><AlertTriangle /></span><div><strong>{result.totalFailed} need attention</strong><small>Fix and try again</small></div></div>{result.failed.length ? result.failed.map((item) => <div className="result-row" key={item.orderNumber}><div><strong>{item.orderNumber}</strong><small>{item.code}</small></div><span>{item.error}</span></div>) : <div className="mini-empty">No failures in this batch.</div>}{result.failed.length > 0 && <button className="button secondary wide" onClick={onRetry}><RefreshCw /> Retry failed</button>}</div></div></section>;
 }
 
 type AnalyticsRange = "all" | "today" | "yesterday" | "day-before" | "tomorrow" | "week" | "month" | "last-7" | "last-30" | "custom";
@@ -549,7 +560,7 @@ const formatPhone = (phone: string) => {
 function HistoryPage() {
   const [items, setItems] = useState<HistoryItem[]>([]); const [loading, setLoading] = useState(true);
   useEffect(() => { api.history().then(({ batches }) => setItems(batches)).finally(() => setLoading(false)); }, []);
-  return <><div className="page-heading"><div><p className="eyebrow">Operations</p><h1>Shipping history</h1><p>Every batch, label, and exception in one place.</p></div></div><section className="card history-card">{loading ? <div className="empty-state"><LoaderCircle className="spin" />Loading batches…</div> : items.length ? items.map((item) => { const warnings = item.shipped.filter((shipment) => shipment.warning).length; return <div className="history-row" key={item.batchId}><div className="history-icon"><PackageCheck /></div><div><strong>{new Date(item.createdAt).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}</strong><small><Clock3 /> {new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · by {item.shippedBy}</small>{warnings > 0 && <small className="history-warning"><AlertTriangle /> {warnings} pickup-scheduled warning{warnings === 1 ? "" : "s"}; counted as successful</small>}</div><div className="history-metrics"><span className="success-text">{item.totalShipped} shipped</span><span className={item.totalFailed ? "error-text" : "muted"}>{item.totalFailed} failed</span></div><div className="history-actions">{item.totalShipped > 0 && <LabelDownloadButton batchId={item.batchId} compact />}{item.failed.length > 0 && <button onClick={() => downloadFailureReport(item)} aria-label="Download errors" title="Download errors"><AlertTriangle /></button>}{item.logs?.length ? <button onClick={() => downloadLogs(item.logs!, item.batchId)} aria-label="Download logs" title="Download logs"><Clock3 /></button> : null}</div></div>; }) : <div className="empty-state"><History /><strong>No shipping history yet</strong><span>Your completed batches will appear here.</span></div>}</section></>;
+  return <><div className="page-heading"><div><p className="eyebrow">Operations</p><h1>Shipping history</h1><p>Every batch, label, and exception in one place.</p></div></div><section className="card history-card">{loading ? <div className="empty-state"><LoaderCircle className="spin" />Loading batches…</div> : items.length ? items.map((item) => { const warnings = item.shipped.filter((shipment) => shipment.warning).length; return <div className="history-row" key={item.batchId}><div className="history-icon"><PackageCheck /></div><div><strong>{new Date(item.createdAt).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}</strong><small><Clock3 /> {new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · by {item.shippedBy}</small>{warnings > 0 && <small className="history-warning"><AlertTriangle /> {warnings} pickup-scheduled warning{warnings === 1 ? "" : "s"}; counted as successful</small>}</div><div className="history-metrics"><span className="success-text">{item.totalShipped} shipped</span><span className={item.totalFailed ? "error-text" : "muted"}>{item.totalFailed} failed</span></div><div className="history-actions">{item.labelUrl && <LabelDownloadButton labelUrl={item.labelUrl} compact />}{warnings > 0 && <PickupLabelButton batchId={item.batchId} labelUrl={item.pickupScheduledLabelUrl} compact />}{item.failed.length > 0 && <button onClick={() => downloadFailureReport(item)} aria-label="Download errors" title="Download errors"><AlertTriangle /></button>}{item.logs?.length ? <button onClick={() => downloadLogs(item.logs!, item.batchId)} aria-label="Download logs" title="Download logs"><Clock3 /></button> : null}</div></div>; }) : <div className="empty-state"><History /><strong>No shipping history yet</strong><span>Your completed batches will appear here.</span></div>}</section></>;
 }
 
 function SettingsPage() {

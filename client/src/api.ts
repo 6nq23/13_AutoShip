@@ -3,9 +3,9 @@ export type User = { username: string; role: Role };
 export type ShippedOrder = { orderNumber: string; orderId: string; awb: string; courier: string; cost: number; alreadyBooked?: boolean; warningCode?: string; warning?: string };
 export type FailedOrder = { orderNumber: string; error: string; code: string };
 export type ShippingLog = { at: string; level: "info" | "success" | "error"; message: string; orderNumber?: string };
-export type ShipResult = { shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; totalShipped: number; totalFailed: number; batchId: string; demoMode: boolean; logs?: ShippingLog[] };
+export type ShipResult = { shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; pickupScheduledLabelUrl?: string | null; totalShipped: number; totalFailed: number; batchId: string; demoMode: boolean; logs?: ShippingLog[] };
 export type HistoryItem = ShipResult & { createdAt: string; shippedBy: string };
-export type ShippingJob = { jobId: string; createdAt: string; updatedAt: string; createdBy: string; status: "queued" | "processing" | "completed" | "failed"; orderNumbers: string[]; processed: number; total: number; shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; logs: ShippingLog[]; error?: string; result?: ShipResult };
+export type ShippingJob = { jobId: string; createdAt: string; updatedAt: string; createdBy: string; status: "queued" | "processing" | "completed" | "failed"; orderNumbers: string[]; processed: number; total: number; shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; pickupScheduledLabelUrl?: string | null; logs: ShippingLog[]; error?: string; result?: ShipResult };
 export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return";
 export type AiProviderName = "gemini" | "claude" | "openai";
 export type WhatsAppMessage = { id: string; phone: string; direction: "inbound" | "outbound"; text: string; intent?: SupportIntent; orderNumber?: string; source?: "customer" | "bot" | "agent"; aiProvider?: AiProviderName; createdAt: string };
@@ -31,9 +31,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body) headers.set("Content-Type", "application/json");
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+  let response: Response;
+  try { response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers }); }
+  catch { throw new Error(`The AutoShip backend is unavailable at ${API_BASE_URL || window.location.origin}. Check the deployment and try again.`); }
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || "Something went wrong. Please try again.");
+  if (!response.ok) throw new Error(`${body.error || "The backend request failed."}${body.code ? ` (${body.code})` : ""}`);
   return body;
 }
 
@@ -46,7 +48,7 @@ export const api = {
   shippingJob: (jobId: string) => request<{ job: ShippingJob }>(`/api/shipping-jobs/${encodeURIComponent(jobId)}`),
   activeShippingJob: () => request<{ job: ShippingJob | null }>("/api/shipping-jobs/active"),
   history: () => request<{ batches: HistoryItem[] }>("/api/history"),
-  historyLabel: (batchId: string) => request<{ labelUrl: string }>(`/api/history/${encodeURIComponent(batchId)}/label`, { method: "POST" }),
+  historyLabel: (batchId: string, scope: "all" | "pickup_scheduled" = "all") => request<{ labelUrl: string }>(`/api/history/${encodeURIComponent(batchId)}/label`, { method: "POST", body: JSON.stringify({ scope }) }),
   status: () => request<{ connected: boolean; demoMode: boolean; apiUrl: string; database: string }>("/api/settings/status"),
   aiStatus: () => request<AiStatus>("/api/settings/ai-status"),
   supportOverview: () => request<SupportOverview>("/api/support/overview"),
