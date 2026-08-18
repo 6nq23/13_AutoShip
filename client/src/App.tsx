@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { IScannerControls } from "@zxing/browser";
-import { AlertTriangle, BarChart3, Box, CalendarDays, Camera, Check, ChevronRight, CircleUserRound, Clock3, Database, Download, Filter, History, Inbox, Keyboard, LoaderCircle, LogOut, MessageCircle, PackageCheck, Plus, RefreshCw, ScanLine, Search, Send, Settings, ShieldCheck, TicketCheck, Trash2, Truck, Users } from "lucide-react";
+import { AlertTriangle, ArrowRight, BarChart3, Box, CalendarDays, Camera, Check, ChevronRight, CircleUserRound, Clock3, Database, Download, Filter, History, Inbox, Keyboard, LayoutDashboard, LoaderCircle, LogOut, MessageCircle, MessagesSquare, PackageCheck, PackageX, Plus, RefreshCw, ScanLine, Search, Send, Settings, ShieldCheck, TicketCheck, Trash2, Truck, Users } from "lucide-react";
 import { api, AiStatus, clearToken, getToken, HistoryItem, normalizeOrder, setToken, ShipResult, ShippingJob, ShippingLog, SupportOverview, User } from "./api";
 
 type Tab = "scan" | "history" | "analytics" | "support" | "settings";
@@ -444,7 +444,7 @@ function AnalyticsPage() {
   </>;
 }
 
-function SupportPage() {
+function LegacySupportPage() {
   const [overview, setOverview] = useState<SupportOverview | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -577,8 +577,157 @@ function SupportPage() {
   </>;
 }
 
+function SupportPage() {
+  const [overview, setOverview] = useState<SupportOverview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [supportView, setSupportView] = useState<"dashboard" | "messages">("dashboard");
+  const [ticketFilter, setTicketFilter] = useState<"open" | "resolved" | "all">("open");
+  const [selectedPhone, setSelectedPhone] = useState("");
+  const [chatSearch, setChatSearch] = useState("");
+  const [chatFilter, setChatFilter] = useState<"all" | "attention" | "automated" | "human">("all");
+  const [messageDraft, setMessageDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [controlPhone, setControlPhone] = useState("");
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
+  const threadEndRef = useRef<HTMLDivElement | null>(null);
+
+  const load = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setLoading(true);
+    try { setOverview(await api.supportOverview()); setLastSyncedAt(new Date()); setError(""); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Support activity could not be loaded."); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { void load(true); const timer = window.setInterval(() => void load(), 5_000); return () => window.clearInterval(timer); }, [load]);
+
+  const chats = useMemo(() => {
+    if (!overview) return [];
+    const phones = new Set([...overview.messages.map((message) => message.phone), ...overview.conversations.map((conversation) => conversation.phone), ...overview.botPauses.map((pause) => pause.phone), ...overview.tickets.map((ticket) => ticket.phone)]);
+    return [...phones].map((phone) => {
+      const messages = overview.messages.filter((message) => message.phone === phone).sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+      const lastMessage = messages.at(-1);
+      const lastOutboundAt = Math.max(0, ...messages.filter((message) => message.direction === "outbound").map((message) => Date.parse(message.createdAt)));
+      const unreadCount = messages.filter((message) => message.direction === "inbound" && Date.parse(message.createdAt) > lastOutboundAt).length;
+      const conversation = overview.conversations.find((item) => item.phone === phone);
+      const pause = overview.botPauses.find((item) => item.phone === phone);
+      const customerTickets = overview.tickets.filter((ticket) => ticket.phone === phone);
+      const latestIntent = [...messages].reverse().find((message) => message.intent)?.intent;
+      const lastActivity = lastMessage?.createdAt || conversation?.updatedAt || pause?.pausedAt || customerTickets[0]?.createdAt || new Date(0).toISOString();
+      return { phone, messages, lastMessage, lastActivity, unreadCount, conversation, pause, tickets: customerTickets, latestIntent };
+    }).sort((left, right) => Date.parse(right.lastActivity) - Date.parse(left.lastActivity));
+  }, [overview]);
+
+  const filteredChats = chats.filter((chat) => {
+    const query = chatSearch.trim().toLowerCase();
+    const digits = query.replace(/\D/g, "");
+    const matchesSearch = !query || Boolean(digits && chat.phone.includes(digits)) || formatPhone(chat.phone).toLowerCase().includes(query) || chat.messages.some((message) => message.text.toLowerCase().includes(query) || message.orderNumber?.toLowerCase().includes(query)) || chat.tickets.some((ticket) => ticket.orderNumber?.toLowerCase().includes(query));
+    const needsAttention = Boolean(chat.pause || chat.unreadCount || chat.tickets.some((ticket) => ticket.status === "open"));
+    return matchesSearch && (chatFilter === "all" || (chatFilter === "attention" && needsAttention) || (chatFilter === "human" && Boolean(chat.pause)) || (chatFilter === "automated" && !chat.pause));
+  });
+  const selectedChat = chats.find((chat) => chat.phone === selectedPhone) || chats[0];
+  useEffect(() => { if (chats.length && !chats.some((chat) => chat.phone === selectedPhone)) setSelectedPhone(chats[0].phone); }, [chats, selectedPhone]);
+  useEffect(() => {
+    if (supportView !== "messages") return;
+    const thread = threadEndRef.current?.parentElement;
+    if (thread) thread.scrollTop = thread.scrollHeight;
+  }, [selectedChat?.messages.length, selectedChat?.phone, supportView]);
+
+  function openConversation(phone: string) { setSelectedPhone(phone); setSupportView("messages"); }
+
+  async function setTicketStatus(ticketId: string, status: "open" | "resolved") {
+    try {
+      await api.updateSupportTicket(ticketId, status);
+      setOverview((current) => current ? { ...current, tickets: current.tickets.map((ticket) => ticket.ticketId === ticketId ? { ...ticket, status, resolvedAt: status === "resolved" ? new Date().toISOString() : undefined } : ticket), stats: { ...current.stats, openTickets: Math.max(0, current.stats.openTickets + (status === "open" ? 1 : -1)) } } : current);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Ticket status could not be updated."); }
+  }
+
+  async function setBotPaused(phone: string, paused: boolean) {
+    if (controlPhone) return;
+    setControlPhone(phone);
+    try {
+      await api.setBotPaused(phone, paused);
+      setOverview((current) => {
+        if (!current) return current;
+        const botPauses = paused ? [{ phone, reason: "manual" as const, pausedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString() }, ...current.botPauses.filter((item) => item.phone !== phone)] : current.botPauses.filter((item) => item.phone !== phone);
+        return { ...current, botPauses, conversations: paused ? current.conversations.filter((item) => item.phone !== phone) : current.conversations };
+      });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Automation control could not be updated."); }
+    finally { setControlPhone(""); }
+  }
+
+  async function sendTeamReply(event: React.FormEvent) {
+    event.preventDefault();
+    const text = messageDraft.trim();
+    if (!selectedChat || !text || sending) return;
+    setSending(true); setError("");
+    try { await api.sendSupportMessage(selectedChat.phone, text); setMessageDraft(""); await load(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "The WhatsApp message could not be sent."); }
+    finally { setSending(false); }
+  }
+
+  if (loading) return <div className="analytics-loading"><LoaderCircle className="spin" /><span>Loading WhatsApp support activity...</span></div>;
+  if (!overview) return <div className="alert error"><AlertTriangle />{error || "Support data is unavailable."}</div>;
+
+  const filteredTickets = overview.tickets.filter((ticket) => ticketFilter === "all" || ticket.status === ticketFilter);
+  const openTickets = overview.tickets.filter((ticket) => ticket.status === "open");
+  const priorityTickets = openTickets.filter((ticket) => ["refund", "return", "missing"].includes(ticket.category));
+  const inboundMessages = overview.messages.filter((message) => message.direction === "inbound");
+  const outboundMessages = overview.messages.filter((message) => message.direction === "outbound");
+  const humanReplies = outboundMessages.filter((message) => message.source === "agent");
+  const recentInbound = [...inboundMessages].sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt)).slice(0, 8);
+  const issueBreakdown = ([
+    ["order_status", "Where is my order?"], ["not_dispatched", "Dispatch delay"], ["confirm_order", "Order / payment check"], ["change_address", "Address or phone change"], ["order_failed", "Failed delivery"], ["refund_return", "Refund / return / missing"],
+  ] as const).map(([intent, label]) => ({ intent, label, count: overview.messages.filter((message) => message.intent === intent && message.direction === "outbound").length }));
+  const largestIssueCount = Math.max(1, ...issueBreakdown.map((item) => item.count));
+  const messageTickets = [...filteredTickets].sort((left, right) => Number(right.phone === selectedChat?.phone) - Number(left.phone === selectedChat?.phone) || Date.parse(right.createdAt) - Date.parse(left.createdAt));
+  const connectionEntries = Object.entries(overview.connections) as Array<[keyof SupportOverview["connections"], boolean]>;
+
+  const ticketCard = (ticket: SupportOverview["tickets"][number], compact = false) => <article className={`support-ticket ticket-${ticket.category} ${compact ? "compact" : ""}`} key={ticket.ticketId}>
+    <header><span className={`ticket-type ${ticket.category}`}>{ticketTypeLabel(ticket.category)}</span><span className={`ticket-status ${ticket.status}`}>{ticket.status}</span></header>
+    <strong>{ticket.orderNumber || formatPhone(ticket.phone)}</strong>
+    <small className="ticket-owner">{ticket.orderNumber ? formatPhone(ticket.phone) : "Customer phone · order ID not provided"}</small>
+    <p>{ticket.description || "Customer requested senior support."}</p>
+    <time>{new Date(ticket.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>
+    <div className="ticket-actions"><button className="button secondary" onClick={() => openConversation(ticket.phone)}>Open chat <ArrowRight /></button><button className="button secondary" onClick={() => void setTicketStatus(ticket.ticketId, ticket.status === "open" ? "resolved" : "open")}>{ticket.status === "open" ? <><Check /> Resolve</> : <><RefreshCw /> Reopen</>}</button></div>
+  </article>;
+
+  return <>
+    <div className="page-heading support-heading"><div><p className="eyebrow">Customer care</p><h1>{supportView === "dashboard" ? "Support dashboard" : "Customer messages"}</h1><p>{supportView === "dashboard" ? "Understand every conversation, issue, and escalation at a glance." : "Read every customer message, reply naturally, and manage escalations beside the conversation."}</p></div><div className="support-sync"><span>{lastSyncedAt ? `Updated ${lastSyncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Connecting…"}</span><button className="button secondary" onClick={() => void load(true)}><RefreshCw /> Refresh</button></div></div>
+    {error && <div className="alert error" role="alert"><AlertTriangle />{error}</div>}
+    <nav className="support-subnav" aria-label="Support pages"><button className={supportView === "dashboard" ? "active" : ""} onClick={() => setSupportView("dashboard")}><LayoutDashboard />Dashboard</button><button className={supportView === "messages" ? "active" : ""} onClick={() => setSupportView("messages")}><MessagesSquare />Messages<span>{chats.length}</span></button></nav>
+
+    {supportView === "dashboard" ? <div className="support-dashboard">
+      <div className="connection-strip" aria-label="Support connections">{connectionEntries.map(([name, connected]) => <span className={connected ? "connection connected" : "connection disconnected"} key={name}><i />{name} {connected ? "ready" : "needs setup"}</span>)}</div>
+      <div className="metric-grid support-metrics"><article className="card metric-card"><span>Messages received</span><strong>{inboundMessages.length}</strong><small>{overview.stats.inboundToday} received today</small></article><article className="card metric-card shipped"><span>Customers</span><strong>{chats.length}</strong><small>Everyone who has messaged you</small></article><article className="card metric-card"><span>Active conversations</span><strong>{overview.stats.activeConversations}</strong><small>Waiting for the next reply</small></article><article className="card metric-card failed"><span>Needs manual help</span><strong>{priorityTickets.length}</strong><small>Refund, return, or missing-item cases</small></article></div>
+      <div className="support-dashboard-grid">
+        <section className="card support-insight-card issue-card"><div className="support-panel-title"><div><BarChart3 /><span><h2>Conversation reasons</h2><p>What customers are asking about</p></span></div></div><div className="issue-breakdown">{issueBreakdown.map((item) => <div className="issue-row" key={item.intent}><div><strong>{item.label}</strong><span>{item.count} replies</span></div><div><i style={{ width: `${Math.max(item.count ? 8 : 0, item.count / largestIssueCount * 100)}%` }} /></div></div>)}</div></section>
+        <section className="card support-insight-card volume-card"><div className="support-panel-title"><div><MessageCircle /><span><h2>Message activity</h2><p>How conversations are being handled</p></span></div></div><div className="volume-stats"><div><span>Customer messages</span><strong>{inboundMessages.length}</strong></div><div><span>Team replies</span><strong>{outboundMessages.length}</strong></div><div><span>Manual replies</span><strong>{humanReplies.length}</strong></div><div><span>Automation paused</span><strong>{overview.botPauses.length}</strong></div></div></section>
+        <section className="card support-insight-card recent-message-card"><div className="support-panel-title"><div><Inbox /><span><h2>Latest customer messages</h2><p>Every recent customer conversation</p></span></div><button className="text-action" onClick={() => setSupportView("messages")}>View inbox <ArrowRight /></button></div>{recentInbound.length ? <div className="recent-customer-list">{recentInbound.map((message) => <button onClick={() => openConversation(message.phone)} key={message.id}><span className="conversation-avatar">{message.phone.slice(-2)}</span><span><strong>{formatPhone(message.phone)}</strong><small>{message.text}</small></span><time>{new Date(message.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time></button>)}</div> : <SupportEmpty icon={<Inbox />} title="No customer messages yet" detail="New WhatsApp messages will appear here." />}</section>
+      </div>
+      <div className="support-dashboard-grid lower">
+        <section className="card support-insight-card dashboard-ticket-card"><div className="support-panel-title"><div><TicketCheck /><span><h2>Escalated tickets</h2><p>Senior-support requests with clear issue types</p></span></div><span className="count-pill">{openTickets.length} open</span></div>{overview.tickets.length ? <div className="dashboard-ticket-list">{overview.tickets.slice(0, 6).map((ticket) => ticketCard(ticket, true))}</div> : <SupportEmpty icon={<TicketCheck />} title="No escalated tickets" detail="Escalations will appear here with their issue type." />}</section>
+        <section className="card support-insight-card priority-queue-card"><div className="support-panel-title"><div><PackageX /><span><h2>Refund & missing-item queue</h2><p>Cases that need your manual decision</p></span></div><span className="count-pill urgent">{priorityTickets.length} waiting</span></div>{priorityTickets.length ? <div className="priority-queue">{priorityTickets.map((ticket) => <button onClick={() => openConversation(ticket.phone)} key={ticket.ticketId}><span className={`priority-icon ${ticket.category}`}>{ticket.category === "missing" ? "M" : ticket.category === "refund" ? "₹" : "R"}</span><span><strong>{ticket.orderNumber || formatPhone(ticket.phone)}</strong><small>{ticketTypeLabel(ticket.category)} · {ticket.description || "Customer needs help"}</small></span><ArrowRight /></button>)}</div> : <SupportEmpty icon={<Check />} title="Queue is clear" detail="No open refund, return, or missing-item requests." />}</section>
+      </div>
+    </div> : <section className="card support-messenger">
+      <aside className="chat-sidebar"><div className="chat-sidebar-head"><div><h2>Conversations</h2><span>{chats.length} customer threads</span></div><span className="count-pill">{chats.filter((chat) => chat.pause || chat.tickets.some((ticket) => ticket.status === "open")).length} need attention</span></div><label className="chat-search"><Search /><input aria-label="Search chats" placeholder="Phone, order ID, or message" value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} /></label><div className="chat-filter-bar" aria-label="Filter conversations">{(["all", "attention", "automated", "human"] as const).map((filter) => <button className={chatFilter === filter ? "active" : ""} onClick={() => setChatFilter(filter)} key={filter}>{filter}</button>)}</div><div className="chat-list">{filteredChats.length ? filteredChats.map((chat) => <button className={selectedChat?.phone === chat.phone ? "active" : ""} onClick={() => setSelectedPhone(chat.phone)} key={chat.phone}><span className={`conversation-avatar ${chat.pause ? "human" : ""}`}>{chat.phone.slice(-2)}</span><span className="chat-list-copy"><strong>{formatPhone(chat.phone)}<em className={chat.pause ? "human" : "automated"}>{chat.pause ? "Manual" : "Auto"}</em></strong><small>{chat.lastMessage?.text || (chat.conversation ? "Waiting for customer" : "No messages yet")}</small>{chat.latestIntent && <i>{friendlyIntent(chat.latestIntent)}</i>}</span><span className="chat-list-meta"><time>{new Date(chat.lastActivity).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>{chat.unreadCount > 0 && <b>{chat.unreadCount}</b>}</span></button>) : <SupportEmpty icon={<Inbox />} title="No matching chats" detail="Try another phone number, order ID, or message." />}</div></aside>
+      <div className="chat-window">{selectedChat ? <><header className="chat-window-head"><div className={`conversation-avatar ${selectedChat.pause ? "human" : ""}`}>{selectedChat.phone.slice(-2)}</div><div><strong>{formatPhone(selectedChat.phone)}</strong><small>{selectedChat.pause ? "Manual control · automatic replies paused" : selectedChat.conversation ? `Automation active · ${friendlyConversationStep(selectedChat.conversation.step)}` : "Automatic replies ready"}</small><span className="chat-context">{selectedChat.messages.length} messages · {selectedChat.tickets.filter((ticket) => ticket.status === "open").length} open tickets</span></div><div className="chat-head-actions"><a className="button secondary" href={`https://wa.me/${selectedChat.phone}`} target="_blank" rel="noreferrer">WhatsApp</a><button className={`button ${selectedChat.pause ? "secondary" : "danger"}`} disabled={controlPhone === selectedChat.phone} onClick={() => void setBotPaused(selectedChat.phone, !selectedChat.pause)}>{controlPhone === selectedChat.phone ? <LoaderCircle className="spin" /> : selectedChat.pause ? "Resume automation" : "Take over"}</button></div></header><div className="chat-thread" aria-live="polite">{selectedChat.messages.length ? selectedChat.messages.map((message) => <article className={`chat-bubble ${message.direction} ${message.source || "bot"}`} key={message.id}><p>{message.text}</p><footer><span>{message.direction === "inbound" ? "Customer" : "Diorin support"}</span><time>{new Date(message.createdAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</time>{message.direction === "outbound" && <Check aria-label="Sent from AutoShip" />}</footer>{(message.intent || message.orderNumber) && <div>{message.intent && <span>{friendlyIntent(message.intent)}</span>}{message.orderNumber && <span>{message.orderNumber}</span>}</div>}</article>) : <SupportEmpty icon={<MessageCircle />} title="No messages in this chat" detail="Messages for this customer will appear here." />}<div ref={threadEndRef} /></div><div className="quick-replies"><span>Quick replies</span>{["I understand the delay is frustrating. Let me check this properly for you.", "Please share your order ID or the phone number used for the order.", "I’m sending this to our senior support team. Please describe your main issue in one clear line."].map((reply) => <button type="button" onClick={() => setMessageDraft(reply)} key={reply}>{reply}</button>)}</div><form className="chat-composer" onSubmit={sendTeamReply}><textarea rows={1} maxLength={2_000} aria-label="WhatsApp reply" placeholder="Write a helpful, natural reply…" value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-meta"><span>{messageDraft.length}/2000</span><button className="button primary" disabled={sending || !messageDraft.trim()}>{sending ? <LoaderCircle className="spin" /> : <Send />}<span>Send</span></button></div></form></> : <SupportEmpty icon={<MessageCircle />} title="No WhatsApp chats yet" detail="Each customer phone number will appear as one conversation." />}</div>
+      <aside className="ticket-rail"><div className="ticket-rail-head"><div><TicketCheck /><span><h2>Escalated tickets</h2><p>Manual follow-up</p></span></div><span className="count-pill">{openTickets.length} open</span></div><div className="ticket-filters" aria-label="Ticket filter">{(["open", "resolved", "all"] as const).map((filter) => <button className={ticketFilter === filter ? "active" : ""} onClick={() => setTicketFilter(filter)} key={filter}>{filter}</button>)}</div>{messageTickets.length ? <div className="ticket-rail-list">{messageTickets.map((ticket) => ticketCard(ticket, true))}</div> : <SupportEmpty icon={<TicketCheck />} title={`No ${ticketFilter === "all" ? "" : `${ticketFilter} `}tickets`} detail="Escalated customer issues appear here." />}</aside>
+    </section>}
+  </>;
+}
+
 function SupportEmpty({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) { return <div className="support-empty">{icon}<strong>{title}</strong><span>{detail}</span></div>; }
 const friendlyIntent = (intent: string) => ({ confirm_order: "Order confirmation", change_address: "Address / phone change", order_status: "Order tracking", not_dispatched: "Dispatch delay", order_failed: "Failed delivery", refund_return: "Refund / return / missing" } as Record<string, string>)[intent] || intent.replace(/_/g, " ");
+const ticketTypeLabel = (category: string) => ({ refund: "Refund request", return: "Return / exchange", missing: "Missing item", other: "Other issue" } as Record<string, string>)[category] || category.replace(/_/g, " ");
+const friendlyConversationStep = (step: string) => ({
+  ai_active: "understanding the request",
+  waiting_order: "waiting for order details",
+  waiting_order_choice: "waiting for an order choice",
+  waiting_action: "waiting for confirmation",
+  waiting_value: "waiting for updated details",
+  waiting_escalation_issue: "waiting for a one-line issue summary",
+  done: "conversation complete",
+} as Record<string, string>)[step] || step.replace(/_/g, " ");
 const formatPhone = (phone: string) => {
   const digits = phone.replace(/\D/g, "");
   const local = digits.length === 12 && digits.startsWith("91") ? digits.slice(2) : digits;

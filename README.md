@@ -157,21 +157,19 @@ Vercel function execution is capped at the configured 300 seconds. Very large or
 
 ## Courier priority
 
-AutoShip pins `courier_id` when booking and tries these couriers in order for each shipment. It stops on the first success and marks the order failed after the seventh rejection:
+AutoShip pins `courier_id` when booking and tries these couriers in order for each shipment. It stops on the first success and marks the order failed after the fifth rejection:
 
-1. Delhivery Surface DT — `6a0d96ef27ad772d357b22cc`
-2. Bluedart Brand — `6a06d0daea73ccc9fd278986`
-3. Delhivery Surface DT_Stressed — `6a0d96ef27ad772d357b230a`
-4. Xpressbees Surface — `6a0d96ef27ad772d357b22b7`
-5. Xpressbees Surface_Stressed — `6a0d96ef27ad772d357b2308`
-6. Delhivery Air — `6a0d96ef27ad772d357b22b4`
-7. Bluedart Brand Air — `6a06d0daea73ccc9fd278979`
+1. Delhivery Air — `6a0d96ef27ad772d357b22b4`
+2. Bluedart Brand Air — `6a06d0daea73ccc9fd278979`
+3. Bluedart Brand — `6a06d0daea73ccc9fd278986`
+4. Delhivery Surface DT_Stressed — `6a0d96ef27ad772d357b230a`
+5. Delhivery Surface DT — `6a0d96ef27ad772d357b22cc`
 
 The corresponding role/rate-sheet IDs are retained in shipment logs for diagnosis, but NimbusPost's `/v2/shipments/book` contract accepts only `order_id` and `courier_id`. Each order has a 60-second overall timeout, so the fallback cannot loop indefinitely.
 
 ## Bulk shipping behavior
 
-NimbusPost exposes a single-order booking endpoint, not one request that books an entire batch. AutoShip therefore creates one persistent bulk job and processes up to five orders concurrently. Inside each order, the configured courier priority is tried sequentially until one courier succeeds or all seven reject it. A one-order batch is a normal single shipment; add at least two orders before pressing **Bulk ship** to see bulk activity. The live panel shows a separate status for every order plus the complete chronological log.
+NimbusPost exposes a single-order booking endpoint, not one request that books an entire batch. AutoShip therefore creates one persistent bulk job and processes up to five orders concurrently. Inside each order, the configured courier priority is tried sequentially until one courier succeeds or all five reject it. A one-order batch is a normal single shipment; add at least two orders before pressing **Bulk ship** to see bulk activity. The live panel shows a separate status for every order plus the complete chronological log.
 
 ## Why `node_modules` and root package files exist
 
