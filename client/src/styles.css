@@ -93,6 +93,10 @@
 .support-messenger{display:grid;grid-template-columns:minmax(230px,285px) minmax(370px,1fr) minmax(235px,285px);height:min(76vh,820px);min-height:680px;overflow:hidden;padding:0}
 .support-messenger .chat-window,.support-messenger .chat-sidebar,.ticket-rail{min-height:0}
 .support-messenger .chat-thread{min-height:0}
+.customer-memory-card{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) auto;gap:8px;padding:9px 12px;background:#fff;border-bottom:1px solid var(--line)}
+.customer-memory-card>div{min-width:0;border:1px solid #ebe6dd;border-radius:9px;background:#faf8f4;padding:7px 9px}
+.customer-memory-card span,.customer-memory-card strong{display:block}.customer-memory-card span{margin-bottom:3px;color:var(--muted);font-size:7px;font-weight:800;text-transform:uppercase;letter-spacing:.05em}.customer-memory-card strong{overflow:hidden;color:var(--ink);font-size:9px;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}
+.chat-head-actions .button svg{width:14px;height:14px}
 .chat-list-copy i{display:block;width:max-content;max-width:100%;margin-top:5px;overflow:hidden;border-radius:99px;background:#f0ede7;padding:3px 6px;color:#777e88;font-size:7px;font-style:normal;font-weight:800;text-overflow:ellipsis;white-space:nowrap}
 .ticket-rail{display:flex;min-width:0;flex-direction:column;border-left:1px solid var(--line);background:#fff}
 .ticket-rail-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:17px 14px 13px}
@@ -124,6 +128,7 @@
   .support-messenger{grid-template-columns:1fr;min-height:0;border-radius:16px}
   .support-messenger .chat-sidebar{height:auto;max-height:390px;border-right:0;border-bottom:1px solid var(--line)}
   .support-messenger .chat-window{height:650px;min-height:650px}
+  .customer-memory-card{grid-template-columns:1fr 1fr}.customer-memory-card>div:first-child{grid-column:1/-1}
   .ticket-rail{grid-column:auto}.ticket-rail-list{grid-template-columns:1fr;max-height:none}
 }
 @media(max-width:440px){
@@ -131,3 +136,10 @@
   .support-ticket .ticket-actions,.ticket-rail .support-ticket .ticket-actions{grid-template-columns:1fr}
   .support-messenger .chat-window{height:620px;min-height:620px}
 }
+/* Support request states and responsive request metrics */
+.ticket-status.awaiting_email{color:#8a5b10!important;background:#fff0c9!important}
+.request-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
+.request-queue-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.request-queue-columns>div{min-width:0;border:1px solid var(--line);border-radius:14px;padding:12px;background:#fcfbf8}.request-queue-columns h3{display:flex;align-items:center;justify-content:space-between;margin:0 0 10px;font:800 13px Manrope}.request-queue-columns h3 span{border-radius:999px;background:#f0ede7;padding:4px 8px;font-size:10px}.request-queue-columns .support-empty{min-height:140px}.ticket-customer-name{font-weight:800;color:var(--ink)}
+@media(max-width:900px){.request-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:700px){.request-queue-columns{grid-template-columns:1fr}}
+@media(max-width:560px){.request-metrics{grid-template-columns:1fr}}

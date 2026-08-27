@@ -40,7 +40,7 @@ export type AppConfig = {
   whatsappSender?: string; whatsappCampaignId?: string; whatsappTemplateName?: string; whatsappTemplateLanguage?: string;
   supportPhone?: string;
   geminiApiKey?: string; geminiModel?: string; claudeApiKey?: string; claudeModel?: string; openaiApiKey?: string; openaiModel?: string;
-  aiPrimaryProvider?: AiProviderName; aiMaxTurns?: number; brainFilePath?: string; escalationPhone?: string;
+  aiPrimaryProvider?: AiProviderName; aiMaxTurns?: number; aiContextMaxChars?: number; brainFilePath?: string; escalationPhone?: string;
 };
 
 type BackgroundScheduler = (task: Promise<void>) => void;
@@ -53,7 +53,7 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
   const shopify = new ShopifyClient({ storeDomain: config.shopifyStoreDomain || "", clientId: config.shopifyClientId || "", clientSecret: config.shopifyClientSecret || "", accessToken: config.shopifyAccessToken, apiVersion: config.shopifyApiVersion, mockMode: config.mockMode });
   const whatsapp = new WhatsAppClient({ provider: config.whatsappProvider || "disabled", accessToken: config.whatsappAccessToken || "", phoneNumberId: config.whatsappPhoneNumberId, verifyToken: config.whatsappVerifyToken, appSecret: config.whatsappAppSecret, apiUrl: config.whatsappApiUrl, serviceApiUrl: config.whatsappServiceApiUrl, sender: config.whatsappSender, campaignId: config.whatsappCampaignId, templateName: config.whatsappTemplateName, templateLanguage: config.whatsappTemplateLanguage, mockMode: config.mockMode });
   const ai = createAiOrchestrator({ geminiApiKey: config.geminiApiKey, geminiModel: config.geminiModel, claudeApiKey: config.claudeApiKey, claudeModel: config.claudeModel, openaiApiKey: config.openaiApiKey, openaiModel: config.openaiModel, primaryProvider: config.aiPrimaryProvider });
-  const whatsappRouter = new WhatsAppRouter({ store, shopify, nimbus, whatsapp, supportPhone: config.supportPhone || "", ai, aiMaxTurns: config.aiMaxTurns, brainFilePath: config.brainFilePath, escalationPhone: config.escalationPhone });
+  const whatsappRouter = new WhatsAppRouter({ store, shopify, nimbus, whatsapp, supportPhone: config.supportPhone || "", ai, aiMaxTurns: config.aiMaxTurns, aiContextMaxChars: config.aiContextMaxChars, brainFilePath: config.brainFilePath, escalationPhone: config.escalationPhone });
   
   const allowedOrigins = new Set([
     "http://localhost:5173",
@@ -232,10 +232,17 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
     } catch (error) { next(error); }
   });
   app.get("/api/support/overview", authenticate, adminOnly, async (_request, response, next) => { try { response.json({ ...(await store.getSupportOverview()), connections: { whatsapp: whatsapp.connected, shopify: shopify.connected, nimbus: config.mockMode || Boolean(config.nimbusApiKey && config.nimbusApiSecret), ai: ai.enabled } }); } catch (error) { next(error); } });
+  app.get("/api/support/customers/:phone/context", authenticate, adminOnly, async (request, response, next) => {
+    try {
+      const localPhone = normalizePhoneNumber(String(request.params.phone || ""));
+      if (!localPhone) return response.status(400).json({ error: "A valid customer phone number is required." });
+      response.json({ context: await store.getCustomerChatContext(`91${localPhone}`) });
+    } catch (error) { next(error); }
+  });
   app.patch("/api/support/tickets/:ticketId", authenticate, adminOnly, async (request, response, next) => {
     try {
       const status = request.body?.status as SupportTicketStatus;
-      if (!(["open", "resolved"] as const).includes(status)) return response.status(400).json({ error: "Status must be open or resolved." });
+      if (!(["awaiting_email", "open", "resolved"] as const).includes(status)) return response.status(400).json({ error: "Status must be awaiting_email, open, or resolved." });
       if (!(await store.updateSupportTicket(String(request.params.ticketId), status))) return response.status(404).json({ error: "Support ticket was not found." });
       response.json({ updated: true });
     } catch (error) { next(error); }

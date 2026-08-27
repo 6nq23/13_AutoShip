@@ -35,8 +35,14 @@ export class AiOrchestrator {
   async chat(messages: ChatMessage[], systemPrompt: string) {
     const failures: AiExhaustedError["failures"] = [];
     for (const provider of this.providers) {
-      try { return { ...(await provider.chat(messages, systemPrompt)), provider: provider.name }; }
-      catch (error) { failures.push({ provider: provider.name, error: error instanceof Error ? error.message : String(error) }); }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const retryMessages = attempt ? [...messages, { role: "user" as const, content: "Your previous output was invalid. Return one complete JSON object matching the required response contract. Do not use markdown." }] : messages;
+          return { ...(await provider.chat(retryMessages, systemPrompt)), provider: provider.name };
+        } catch (error) {
+          if (attempt === 1) failures.push({ provider: provider.name, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
     }
     throw new AiExhaustedError(failures);
   }
@@ -60,7 +66,7 @@ class GeminiProvider implements AiProvider {
       {
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: messages.map((message) => ({ role: message.role === "assistant" ? "model" : "user", parts: [{ text: message.content }] })),
-        generationConfig: { maxOutputTokens: 500, responseMimeType: "application/json" },
+        generationConfig: { maxOutputTokens: 700, responseMimeType: "application/json", responseSchema: AI_RESPONSE_SCHEMA },
       },
       { "x-goog-api-key": this.apiKey },
     );
@@ -121,7 +127,10 @@ export function parseAiResponse(raw: string): AiResponse {
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   let value: unknown;
   try { value = JSON.parse(cleaned); }
-  catch { return { text: cleaned.slice(0, 2_000), resolved: false }; }
+  catch {
+    if (/^[{[]/.test(cleaned)) throw new Error("AI returned malformed JSON");
+    return { text: cleaned.slice(0, 2_000), resolved: false };
+  }
   if (!value || typeof value !== "object") return { text: cleaned.slice(0, 2_000), resolved: false };
   const record = value as Record<string, unknown>;
   const toolCalls = Array.isArray(record.toolCalls)
@@ -134,8 +143,24 @@ export function parseAiResponse(raw: string): AiResponse {
     ...(toolCalls.length ? { toolCalls } : {}),
     resolved: record.resolved === true,
     escalate: record.escalate === true,
+    ...(typeof record.intent === "string" && SUPPORT_INTENTS.has(record.intent) ? { intent: record.intent as AiResponse["intent"] } : {}),
+    ...(typeof record.summary === "string" && record.summary.trim() ? { summary: record.summary.trim().slice(0, 2_000) } : {}),
   };
 }
+
+const SUPPORT_INTENTS = new Set(["confirm_order", "change_address", "order_status", "not_dispatched", "order_failed", "refund_return", "product_inquiry", "additional_purchase", "real_picture_request", "contact_request"]);
+const AI_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    text: { type: "STRING" },
+    toolCalls: { type: "ARRAY", items: { type: "OBJECT", properties: { name: { type: "STRING" }, arguments: { type: "OBJECT", properties: { identifier: { type: "STRING" }, phone: { type: "STRING" }, intent: { type: "STRING" }, reason: { type: "STRING" }, category: { type: "STRING" }, order_number: { type: "STRING" } } } }, required: ["name", "arguments"] } },
+    resolved: { type: "BOOLEAN" },
+    escalate: { type: "BOOLEAN" },
+    intent: { type: "STRING" },
+    summary: { type: "STRING" },
+  },
+  required: ["text", "resolved", "escalate", "summary"],
+};
 
 function asArguments(value: unknown): Record<string, unknown> {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
